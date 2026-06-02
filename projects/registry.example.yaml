@@ -1,0 +1,37 @@
+# 复制为 registry.yaml 并修改 root 为服务器上的绝对路径：
+#   cp projects/registry.example.yaml projects/registry.yaml
+#
+# 或通过环境变量指定任意路径：
+#   export SMARTCODE_BROWSER_REGISTRY=/etc/smartcode/registry.yaml
+
+projects:
+  - id: demo-python
+    name: "示例 Python 项目"
+    root: /path/to/your/python/repo
+    language: python
+    include_paths:
+      - src
+    exclude_dirs: [.git, __pycache__, .venv, node_modules, build, dist]
+
+  - id: linux-cpuidle
+    name: "Linux 内核 - cpuidle (C)"
+    root: /path/to/linux-stable
+    language: c
+    include_paths:
+      - drivers/cpuidle
+      - drivers/cpufreq
+      - kernel/sched
+      - kernel/time
+      - include/linux
+      - include/asm-generic
+    exclude_dirs: [.git, tools, Documentation, samples]
+
+  - id: chipyard
+    name: "Chipyard (Scala/Chisel)"
+    root: /path/to/chipyard
+    language: scala
+    include_paths:
+      - generators/chipyard/src
+      - generators/rocket-chip/src
+    extra_languages: [verilog, c]
+    exclude_dirs: [.git, target, build]

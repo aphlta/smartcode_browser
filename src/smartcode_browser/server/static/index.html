@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SmartCode 代码浏览器 · 级联跳转</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- 顶栏：项目选择 + 符号搜索 -->
+  <header class="topbar">
+    <div class="brand">SmartCode<span>· 级联代码浏览器</span></div>
+
+    <div class="controls">
+      <select id="project-select" title="选择项目"></select>
+
+      <div class="search-wrap">
+        <input id="search-input" type="text" placeholder="搜索函数 / 方法 / 类…" autocomplete="off" />
+        <div id="search-results" class="search-results hidden"></div>
+      </div>
+
+      <span id="stats" class="stats"></span>
+    </div>
+
+    <!-- 会话标签：保存/恢复整棵代码树 -->
+    <div class="session-bar">
+      <button id="btn-save-bookmark" type="button" title="把当前代码树保存为命名标签">保存到标签</button>
+      <div id="bookmark-list" class="bookmark-list" title="点击标签恢复对应代码树"></div>
+    </div>
+  </header>
+
+  <!-- 保存标签对话框 -->
+  <div id="bookmark-dialog" class="bookmark-dialog hidden">
+    <div class="bookmark-dialog-inner">
+      <div class="bookmark-dialog-title">保存当前代码树</div>
+      <input id="bookmark-name-input" type="text" placeholder="例如：cpuidle → do_idle" autocomplete="off" />
+      <div class="bookmark-dialog-actions">
+        <button id="bookmark-save-ok" type="button">保存</button>
+        <button id="bookmark-save-cancel" type="button" class="muted">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 级联面板容器：按调用深度横向排列，分支在同列纵向堆叠 -->
+  <main id="board" class="board">
+    <div id="empty-hint" class="empty-hint">
+      <h2>开始浏览</h2>
+      <p>① 选择上方项目 → ② 搜索一个函数并打开 → ③ 点击函数体内的<strong>蓝色调用</strong>，会在右侧展开它的定义。</p>
+      <p>浏览状态会<strong>自动保存</strong>，刷新或重启后会恢复；也可点顶栏「保存到标签」把当前代码树存成书签。</p>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smartcode-browser"
+version = "0.1.0"
+description = "Cascade code browser: click calls to expand definitions in a visual tree (C/Python/Java/Scala)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pyyaml>=6.0",
+    "tree-sitter>=0.21",
+    "tree-sitter-c>=0.21",
+    "tree-sitter-python>=0.21",
+    "tree-sitter-java>=0.21",
+    "tree-sitter-scala>=0.21",
+]
+
+[project.optional-dependencies]
+verilog = ["tree-sitter-verilog>=0.21"]
+
+[project.scripts]
+smartcode-browser = "smartcode_browser.server.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/your-username/smartcode-browser"
+Documentation = "https://github.com/your-username/smartcode-browser#readme"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smartcode_browser"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/projects/registry.example.yaml",
+  "/deploy",
+  "/README.md",
+]

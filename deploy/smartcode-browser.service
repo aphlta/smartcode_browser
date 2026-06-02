@@ -1,0 +1,16 @@
+[Unit]
+Description=SmartCode Cascade Code Browser
+After=network.target
+
+[Service]
+Type=simple
+User=smartcode
+WorkingDirectory=/opt/smartcode-browser
+Environment=SMARTCODE_BROWSER_REGISTRY=/etc/smartcode/registry.yaml
+Environment=SMARTCODE_BROWSER_HOST=127.0.0.1
+Environment=SMARTCODE_BROWSER_PORT=8780
+ExecStart=/opt/smartcode-browser/.venv/bin/smartcode-browser
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
