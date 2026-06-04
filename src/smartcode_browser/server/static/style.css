@@ -246,6 +246,12 @@ html, body {
   box-shadow: 0 2px 8px rgba(0,0,0,0.3);
 }
 .panel.focused { border-color: var(--accent); }
+.panel.manual-pos { border-color: #d29922; } /* 手动定位的面板略作区分 */
+.panel.dragging {
+  opacity: 0.92;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  z-index: 40;
+}
 
 .panel-header {
   display: flex;
@@ -254,8 +260,11 @@ html, body {
   padding: 8px 10px;
   background: var(--bg-header);
   border-bottom: 1px solid var(--border);
-  cursor: pointer;
+  cursor: grab;
+  user-select: none;
 }
+.panel-header:active { cursor: grabbing; }
+.panel.dragging .panel-header { cursor: grabbing; }
 .panel-header .fn { color: var(--accent); font-family: monospace; font-weight: 600; font-size: 13px; }
 .panel-header .kind {
   color: var(--text-dim); font-size: 10px;

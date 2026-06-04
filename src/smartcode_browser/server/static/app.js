@@ -83,6 +83,12 @@ function serializeState() {
         line: d.start_line,
         parentIndex: p.parentId != null ? idToIdx.get(p.parentId) : -1,
         fromRef: p.fromRef,
+        manualPos: p.manualPos || null,
+        // 同一函数被多处引用时，额外来源边（不重复开面板）
+        extraLinks: (p.extraLinks || []).map((l) => ({
+          parentIndex: idToIdx.get(l.parentId),
+          fromRef: l.fromRef,
+        })).filter((l) => l.parentIndex >= 0),
       };
     }),
   };
@@ -223,8 +229,18 @@ async function restoreSession(snap) {
       const id = "p" + state.seq++;
       const parentId = ps.parentIndex >= 0 ? builtIds[ps.parentIndex] : null;
       insertPanel(detail, parentId, ps.fromRef, id);
+      if (ps.manualPos) state.panels.get(id).manualPos = ps.manualPos;
       builtIds.push(id);
     }
+    // 恢复「复用面板」的额外来源连线
+    snap.panels.forEach((ps, i) => {
+      if (!ps.extraLinks?.length) return;
+      const targetId = builtIds[i];
+      for (const xl of ps.extraLinks) {
+        const parentId = builtIds[xl.parentIndex];
+        if (parentId) linkPanelFrom(parentId, xl.fromRef, targetId, { silent: true });
+      }
+    });
     render();
     requestAnimationFrame(() => {
       if (snap.boardScroll) {
@@ -388,6 +404,60 @@ function addPanel(detail, parentId, fromRef) {
 
 function refKey(ref) { return `${ref.name}@${ref.line}:${ref.col}`; }
 
+/** 符号唯一键：同一 file+行 视为同一定义，可复用面板 */
+function symbolKey(detail) {
+  return `${detail.file}:${detail.start_line}`;
+}
+
+function findPanelBySymbol(detail) {
+  const key = symbolKey(detail);
+  for (const id of state.order) {
+    const p = state.panels.get(id);
+    if (p?.detail && symbolKey(p.detail) === key) return id;
+  }
+  return null;
+}
+
+/** 面板的所有入边（主父链 + 复用时的额外来源） */
+function panelLinks(panel) {
+  const links = [];
+  if (panel.parentId && panel.fromRef) {
+    links.push({ parentId: panel.parentId, fromRef: panel.fromRef });
+  }
+  if (panel.extraLinks) links.push(...panel.extraLinks);
+  return links;
+}
+
+/**
+ * 把 parent 的某次点击关联到已有面板（不新建重复面板）。
+ * 主父链不变；额外来源记入 extraLinks，decorate 会画多条箭头。
+ */
+function linkPanelFrom(parentId, fromRef, targetId, opts = {}) {
+  const parent = state.panels.get(parentId);
+  const target = state.panels.get(targetId);
+  if (!parent || !target || parentId === targetId) return false;
+  const rk = refKey(fromRef);
+  parent.childByRef = parent.childByRef || {};
+  if (parent.childByRef[rk] === targetId) return true;
+  parent.childByRef[rk] = targetId;
+  const isPrimary =
+    target.parentId === parentId &&
+    target.fromRef && refKey(target.fromRef) === rk;
+  if (!isPrimary) {
+    target.extraLinks = target.extraLinks || [];
+    const dup = target.extraLinks.some(
+      (l) => l.parentId === parentId && refKey(l.fromRef) === rk
+    );
+    if (!dup) target.extraLinks.push({ parentId, fromRef });
+  }
+  if (!opts.silent) {
+    state.focusNew = targetId;
+    render();
+    schedulePersist();
+  }
+  return true;
+}
+
 // 关闭面板及其所有后代
 function closePanel(id) {
   const toRemove = new Set();
@@ -399,6 +469,19 @@ function closePanel(id) {
     }
   };
   collect(id);
+  // 清理 childByRef / extraLinks 中对被删面板的引用
+  for (const pid of state.order) {
+    if (toRemove.has(pid)) continue;
+    const p = state.panels.get(pid);
+    if (p.childByRef) {
+      for (const [k, v] of Object.entries(p.childByRef)) {
+        if (toRemove.has(v)) delete p.childByRef[k];
+      }
+    }
+    if (p.extraLinks) {
+      p.extraLinks = p.extraLinks.filter((l) => !toRemove.has(l.parentId));
+    }
+  }
   state.order = state.order.filter((pid) => !toRemove.has(pid));
   toRemove.forEach((pid) => state.panels.delete(pid));
   render();
@@ -449,13 +532,13 @@ async function navFromToken(panelId, el, ev) {
     return;
   }
   if (cands.length === 1) {
-    await openCandidate(panelId, fromRef, cands[0]);
+    await openCandidate(panelId, fromRef, cands[0], ev.shiftKey);
   } else {
     showCandidateMenu(panelId, fromRef, el, cands);
   }
 }
 
-async function openCandidate(panelId, ref, cand) {
+async function openCandidate(panelId, ref, cand, forceNew = false) {
   // 局部变量声明：就在当前函数面板内，闪烁定位即可，不另开面板
   if (cand.kind === "local") {
     flashLine(panelId, cand.line);
@@ -464,6 +547,14 @@ async function openCandidate(panelId, ref, cand) {
   try {
     const detail = await fetchSymbol(cand.file, cand.name, cand.line);
     if (!detail) { toast("目标源码不可读"); return; }
+    // 同一函数已在树中 → 复用面板并追加来源连线（Shift+点击 强制新开）
+    if (!forceNew) {
+      const existingId = findPanelBySymbol(detail);
+      if (existingId && existingId !== panelId) {
+        linkPanelFrom(panelId, ref, existingId);
+        return;
+      }
+    }
     addPanel(detail, panelId, ref);
   } catch (e) { toast("展开失败: " + e.message); }
 }
@@ -585,7 +676,10 @@ function showCandidateMenu(panelId, ref, anchorEl, candidates) {
     item.innerHTML =
       `<span>${escapeHtml(c.name)}</span>${kindTag}${tag}` +
       `<span class="cf">${escapeHtml(c.file)}:${c.line}</span>`;
-    item.onclick = () => { closeCandidateMenu(); openCandidate(panelId, ref, c); };
+    item.onclick = (e) => {
+      closeCandidateMenu();
+      openCandidate(panelId, ref, c, e.shiftKey);
+    };
     menu.appendChild(item);
   });
   document.body.appendChild(menu);
@@ -613,6 +707,110 @@ function focusPanel(id) {
 // 列间距（父子横向留白）/ 行间距 / 内边距
 const LAYOUT = { colGap: 96, rowGap: 18, padX: 20, padY: 16 };
 
+/** 根据当前面板位置撑开画布滚动区域 */
+function updateBoardSizer() {
+  let maxRight = LAYOUT.padX, maxBottom = LAYOUT.padY;
+  for (const id of state.order) {
+    const p = state.panels.get(id);
+    if (!p?.el) continue;
+    const left = p._left ?? 0;
+    const top = p._top ?? 0;
+    maxRight = Math.max(maxRight, left + p.el.offsetWidth);
+    maxBottom = Math.max(maxBottom, top + p.el.offsetHeight);
+  }
+  let sizer = el.board.querySelector(".board-sizer");
+  if (!sizer) {
+    sizer = document.createElement("div");
+    sizer.className = "board-sizer";
+    el.board.appendChild(sizer);
+  }
+  sizer.style.left = (maxRight + LAYOUT.padX) + "px";
+  sizer.style.top = (maxBottom + LAYOUT.padY) + "px";
+}
+
+// ---------- 面板拖动（标题栏拖拽；双击标题恢复自动布局） ----------
+
+let dragState = null;
+
+function setupPanelDrag(header, panelId) {
+  header.title = "拖动移动 · 双击恢复自动布局";
+
+  header.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || e.target.closest(".close")) return;
+    const panel = state.panels.get(panelId);
+    if (!panel?.el) return;
+    e.preventDefault();
+
+    dragState = {
+      panelId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startLeft: panel._left ?? panel.el.offsetLeft,
+      startTop: panel._top ?? panel.el.offsetTop,
+      moved: false,
+    };
+    panel.el.classList.add("dragging");
+    focusPanel(panelId);
+
+    document.addEventListener("mousemove", onPanelDragMove);
+    document.addEventListener("mouseup", onPanelDragEnd);
+  });
+
+  header.addEventListener("dblclick", (e) => {
+    if (e.target.closest(".close")) return;
+    const panel = state.panels.get(panelId);
+    if (!panel) return;
+    delete panel.manualPos;
+    render();
+    schedulePersist();
+    toast("已恢复自动布局");
+  });
+
+  header.addEventListener("click", (e) => {
+    if (e.target.closest(".close")) return;
+    if (header._suppressClick) {
+      header._suppressClick = false;
+      return;
+    }
+    focusPanel(panelId);
+  });
+}
+
+function onPanelDragMove(e) {
+  if (!dragState) return;
+  const panel = state.panels.get(dragState.panelId);
+  if (!panel?.el) return;
+
+  const dx = e.clientX - dragState.startX;
+  const dy = e.clientY - dragState.startY;
+  if (Math.abs(dx) > 2 || Math.abs(dy) > 2) dragState.moved = true;
+
+  const left = Math.max(LAYOUT.padX, dragState.startLeft + dx);
+  const top = Math.max(LAYOUT.padY, dragState.startTop + dy);
+
+  panel.manualPos = { left, top };
+  // 基于新位置重排其余（非手动）子面板，避免重叠
+  layout();
+  drawConnectors();
+  e.preventDefault();
+}
+
+function onPanelDragEnd() {
+  if (!dragState) return;
+  const panel = state.panels.get(dragState.panelId);
+  const header = panel?.el?.querySelector(".panel-header");
+  if (panel?.el) panel.el.classList.remove("dragging");
+  if (dragState.moved) {
+    if (header) header._suppressClick = true;
+    layout();
+    decorate();
+    schedulePersist();
+  }
+  dragState = null;
+  document.removeEventListener("mousemove", onPanelDragMove);
+  document.removeEventListener("mouseup", onPanelDragEnd);
+}
+
 function render() {
   el.emptyHint.classList.toggle("hidden", state.order.length > 0);
 
@@ -634,13 +832,48 @@ function render() {
 
 /*
  * 平衡树布局（调用行锚定 + 最小位移去重叠）：
- * - x 由调用深度决定（列），列宽自适应。
- * - 每个子面板的「理想 y」= 父面板中对应调用行的位置，于是子面板首先贴近调用行。
- * - 同列内若多个子面板的理想位置重叠，用「聚簇合并」算法把它们围绕各自理想位置
- *   对称散开（既往上也往下），整体偏移最小——这就是「均衡」：既贴近调用行，
- *   多个子面板又按各自调用行相对对齐、不挤压。
- * - 顺序天然正确：理想 y 随调用行单调，第 120 行的调用必在第 121 行调用的上方。
+ * - 手动拖过的面板固定不动（manualPos），作为障碍物。
+ * - 其余面板仍按调用行锚定 + 聚簇去重叠，并避让所有手动面板，避免互相覆盖。
+ * - 父面板被拖动后，子面板的理想 y 随 parent._top 更新（逐 depth 传播）。
  */
+function hRangesOverlap(l1, r1, l2, r2) {
+  return l1 < r2 && l2 < r1;
+}
+
+/** 将 auto 面板下推，直到不与 obstacles 中的矩形（含 gap）相交 */
+function pushBelowObstacles(top, left, width, height, obstacles, gap) {
+  let t = top;
+  for (let guard = 0; guard < 64; guard++) {
+    let moved = false;
+    for (const o of obstacles) {
+      if (!hRangesOverlap(left, left + width, o.left, o.right)) continue;
+      if (t < o.bottom + gap && t + height > o.top - gap) {
+        const next = o.bottom + gap;
+        if (next > t) { t = next; moved = true; }
+      }
+    }
+    if (!moved) break;
+  }
+  return t;
+}
+
+function panelObstacle(p) {
+  return {
+    left: p._left,
+    top: p._top,
+    right: p._left + p.el.offsetWidth,
+    bottom: p._top + p.el.offsetHeight,
+  };
+}
+
+function applyPanelPos(p, left, top) {
+  p._left = left;
+  p._top = top;
+  p.el.style.left = left + "px";
+  p.el.style.top = top + "px";
+  p.el.style.visibility = "visible";
+}
+
 function layout() {
   if (!state.order.length) return;
 
@@ -660,34 +893,66 @@ function layout() {
   const H = (id) => state.panels.get(id).el.offsetHeight;
   let maxRight = 0, maxBottom = 0;
 
-  // 逐层（depth 升序）：父层定位完成后，才能据父调用行算子层理想 y
-  for (let d = 0; d <= maxDepth; d++) {
-    const items = byDepth[d].map((id) => {
-      const p = state.panels.get(id);
-      let desired = LAYOUT.padY;
-      if (p.parentId && p.fromRef) {
-        const parent = state.panels.get(p.parentId);
-        // 子面板头部对齐到父面板中的调用行
-        desired = (parent._top ?? LAYOUT.padY) +
-          callLineOffset(parent, p.fromRef.line) - 18;
-      }
-      return { id, desired: Math.max(LAYOUT.padY, desired), h: H(id) };
-    });
-
-    const pos = resolveOverlaps(items, LAYOUT.rowGap, LAYOUT.padY);
-    for (const it of items) {
-      const p = state.panels.get(it.id);
-      p._top = pos[it.id];
-      p._left = colX[d];
-      p.el.style.left = colX[d] + "px";
-      p.el.style.top = p._top + "px";
-      p.el.style.visibility = "visible";
-      maxRight = Math.max(maxRight, colX[d] + p.el.offsetWidth);
-      maxBottom = Math.max(maxBottom, p._top + it.h);
+  // 先固定所有手动面板，并收集为障碍物
+  const obstacles = [];
+  for (const id of state.order) {
+    const p = state.panels.get(id);
+    if (p.manualPos) {
+      applyPanelPos(p, p.manualPos.left, p.manualPos.top);
+      p.el.classList.add("manual-pos");
+      obstacles.push(panelObstacle(p));
+      maxRight = Math.max(maxRight, p._left + p.el.offsetWidth);
+      maxBottom = Math.max(maxBottom, p._top + p.el.offsetHeight);
+    } else {
+      p.el.classList.remove("manual-pos");
     }
   }
 
-  // 撑出滚动区域（复用同一个 sizer）
+  // 逐层布局自动面板：理想 y 随父面板（含拖动后的 _top）传播
+  for (let d = 0; d <= maxDepth; d++) {
+    const autoItems = [];
+    for (const id of byDepth[d]) {
+      const p = state.panels.get(id);
+      if (p.manualPos) continue;
+      let desired = LAYOUT.padY;
+      if (p.parentId && p.fromRef) {
+        const parent = state.panels.get(p.parentId);
+        desired = (parent._top ?? LAYOUT.padY) +
+          callLineOffset(parent, p.fromRef.line) - 18;
+      }
+      autoItems.push({ id, desired: Math.max(LAYOUT.padY, desired), h: H(id) });
+    }
+    if (!autoItems.length) continue;
+
+    let pos = resolveOverlaps(autoItems, LAYOUT.rowGap, LAYOUT.padY);
+
+    // 避让手动面板
+    for (const it of autoItems) {
+      const p = state.panels.get(it.id);
+      const left = colX[d];
+      const w = p.el.offsetWidth;
+      pos[it.id] = pushBelowObstacles(pos[it.id], left, w, it.h, obstacles, LAYOUT.rowGap);
+    }
+
+    // 避让后同列自动面板之间可能再次重叠 → 二次聚簇
+    const readjusted = autoItems.map((it) => ({ ...it, desired: pos[it.id] }));
+    pos = resolveOverlaps(readjusted, LAYOUT.rowGap, LAYOUT.padY);
+    for (const it of autoItems) {
+      const p = state.panels.get(it.id);
+      const left = colX[d];
+      const w = p.el.offsetWidth;
+      pos[it.id] = pushBelowObstacles(pos[it.id], left, w, it.h, obstacles, LAYOUT.rowGap);
+    }
+
+    for (const it of autoItems) {
+      const p = state.panels.get(it.id);
+      applyPanelPos(p, colX[d], pos[it.id]);
+      maxRight = Math.max(maxRight, colX[d] + p.el.offsetWidth);
+      maxBottom = Math.max(maxBottom, pos[it.id] + it.h);
+    }
+  }
+
+  // 撑出滚动区域
   let sizer = el.board.querySelector(".board-sizer");
   if (!sizer) {
     sizer = document.createElement("div");
@@ -697,7 +962,6 @@ function layout() {
   sizer.style.left = (maxRight + LAYOUT.padX) + "px";
   sizer.style.top = (maxBottom + LAYOUT.padY) + "px";
 
-  // 把最近打开的面板滚入视野
   if (state.focusNew) {
     const node = state.panels.get(state.focusNew)?.el;
     if (node) node.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
@@ -795,8 +1059,9 @@ function renderPanel(panel) {
     `<span class="file" title="${escapeHtml(d.file)}">${escapeHtml(d.file)}:${d.start_line}</span>` +
     `<span class="close" title="关闭此面板及右侧分支">×</span>`;
   header.querySelector(".close").onclick = (e) => { e.stopPropagation(); closePanel(panel.id); };
-  header.onclick = () => focusPanel(panel.id);
+  setupPanelDrag(header, panel.id);
   node.appendChild(header);
+  if (panel.manualPos) node.classList.add("manual-pos");
 
   if (d.doc) {
     const doc = document.createElement("div");
@@ -862,14 +1127,17 @@ function decorate() {
 
   for (const id of state.order) {
     const panel = state.panels.get(id);
-    if (!panel.parentId || !panel.fromRef) continue;
-    const parentEl = document.querySelector(`.panel[data-id="${panel.parentId}"]`);
-    if (!parentEl) continue;
-    const parent = state.panels.get(panel.parentId);
-    if (!parent.detail) continue; // 用法面板等无代码行，跳过来源行高亮
-    const idx = panel.fromRef.line - parent.detail.start_line;
-    const lineEls = parentEl.querySelectorAll(".code-line");
-    if (idx >= 0 && idx < lineEls.length) lineEls[idx].classList.add("src-highlight");
+    const childEl = document.querySelector(`.panel[data-id="${id}"]`);
+    if (!childEl) continue;
+    for (const link of panelLinks(panel)) {
+      const parentEl = document.querySelector(`.panel[data-id="${link.parentId}"]`);
+      if (!parentEl) continue;
+      const parent = state.panels.get(link.parentId);
+      if (!parent?.detail) continue;
+      const idx = link.fromRef.line - parent.detail.start_line;
+      const lineEls = parentEl.querySelectorAll(".code-line");
+      if (idx >= 0 && idx < lineEls.length) lineEls[idx].classList.add("src-highlight");
+    }
   }
   drawConnectors();
 }
@@ -899,34 +1167,34 @@ function drawConnectors() {
 
   for (const id of state.order) {
     const panel = state.panels.get(id);
-    if (!panel.parentId || !panel.fromRef) continue;
     const childEl = document.querySelector(`.panel[data-id="${id}"]`);
-    const parentEl = document.querySelector(`.panel[data-id="${panel.parentId}"]`);
-    if (!childEl || !parentEl) continue;
-
-    const pRect = parentEl.getBoundingClientRect();
+    if (!childEl) continue;
     const cRect = childEl.getBoundingClientRect();
-    const parent = state.panels.get(panel.parentId);
-    const idx = parent.detail ? panel.fromRef.line - parent.detail.start_line : -1;
-    const lineEls = parentEl.querySelectorAll(".code-line");
-
-    // 起点 y：取来源行中心，但夹在父面板可见范围内（代码可能滚动到视野外）
-    let y1 = pRect.top + 40;
-    if (idx >= 0 && idx < lineEls.length) {
-      const lr = lineEls[idx].getBoundingClientRect();
-      y1 = Math.min(Math.max(lr.top + lr.height / 2, pRect.top + 30), pRect.bottom - 8);
-    }
-    const x1 = pRect.right;
-    const x2 = cRect.left;
     const y2 = Math.min(Math.max(cRect.top + 20, 0), vh);
 
-    const mx = (x1 + x2) / 2;
-    const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("class", "link");
-    path.setAttribute("d", d);
-    path.setAttribute("marker-end", "url(#arrow)");
-    svg.appendChild(path);
+    for (const link of panelLinks(panel)) {
+      const parentEl = document.querySelector(`.panel[data-id="${link.parentId}"]`);
+      if (!parentEl) continue;
+      const pRect = parentEl.getBoundingClientRect();
+      const parent = state.panels.get(link.parentId);
+      const idx = parent?.detail ? link.fromRef.line - parent.detail.start_line : -1;
+      const lineEls = parentEl.querySelectorAll(".code-line");
+
+      let y1 = pRect.top + 40;
+      if (idx >= 0 && idx < lineEls.length) {
+        const lr = lineEls[idx].getBoundingClientRect();
+        y1 = Math.min(Math.max(lr.top + lr.height / 2, pRect.top + 30), pRect.bottom - 8);
+      }
+      const x1 = pRect.right;
+      const x2 = cRect.left;
+      const mx = (x1 + x2) / 2;
+      const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("class", "link");
+      path.setAttribute("d", d);
+      path.setAttribute("marker-end", "url(#arrow)");
+      svg.appendChild(path);
+    }
   }
 }
 
