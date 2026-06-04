@@ -367,7 +367,10 @@ async function runSearch(q) {
 
   el.searchResults.innerHTML = "";
   if (!results.length) {
-    el.searchResults.innerHTML = `<div class="item">无匹配符号</div>`;
+    const hint = /^(?:in:|@)/i.test(q)
+      ? "无匹配（检查路径是否在已索引文件内）"
+      : "无匹配符号";
+    el.searchResults.innerHTML = `<div class="item">${hint}</div>`;
   } else {
     results.forEach((r) => {
       const div = document.createElement("div");

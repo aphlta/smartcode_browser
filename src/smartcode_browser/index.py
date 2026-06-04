@@ -27,7 +27,7 @@ _MAX_FILES = 20000
 _MAX_GLOBAL_FILES = 40
 
 # 合法标识符（防止把任意字符串拼进 grep 正则）
-_IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
+_IDENT_RE = re.compile(r"^[A-Za-z_]\w+$")
 
 
 class SymbolIndex:
@@ -154,13 +154,103 @@ class SymbolIndex:
                     best = sym
         return best
 
-    def search(self, query: str, limit: int = 40) -> list[Symbol]:
-        """按名称模糊搜索符号：前缀优先，其次子串。"""
-        self.build()
+    @staticmethod
+    def parse_search_query(query: str) -> tuple[str | None, str]:
+        """解析搜索框输入，拆成 (路径过滤, 符号名)。
+
+        支持在搜索框里写路径，避免 ``main`` 在全库中刷屏：
+        - ``in:nemu main``、``in:nemu/src/xxx.c main``
+        - ``in:nemu/ main``：仅匹配以 ``nemu/`` 开头的路径（排除 platform/nemu）
+        - ``@npc main``（``@`` 是 ``in:`` 的简写）
+        路径按相对项目根的子串匹配（不区分大小写）；索引未收录时会 grep 回退。
+        """
         q = query.strip()
         if not q:
+            return None, ""
+        low = q.lower()
+        if low.startswith("in:") or q.startswith("@"):
+            prefix_len = 3 if low.startswith("in:") else 1
+            rest = q[prefix_len:].lstrip()
+            if not rest:
+                return None, ""
+            if " " in rest:
+                path_part, name_part = rest.split(None, 1)
+                return path_part.strip(), name_part.strip()
+            return rest, ""
+
+        return None, q
+
+    @staticmethod
+    def _rank_symbols_by_name(symbols: list[Symbol], name_q: str, limit: int) -> list[Symbol]:
+        """按符号名排序：精确 > 前缀 > 子串；无符号名时按文件路径+行号。"""
+        if not name_q:
+            ordered = sorted(symbols, key=lambda s: (s.file.lower(), s.start_line, s.name.lower()))
+            return ordered[:limit]
+        ql = name_q.lower()
+        exact: list[Symbol] = []
+        prefix: list[Symbol] = []
+        substr: list[Symbol] = []
+        seen: set[tuple[str, int, str]] = set()
+        for sym in symbols:
+            key = (sym.file, sym.start_line, sym.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            nl = sym.name.lower()
+            if nl == ql:
+                exact.append(sym)
+            elif nl.startswith(ql):
+                prefix.append(sym)
+            elif ql in nl:
+                substr.append(sym)
+        return (exact + prefix + substr)[:limit]
+
+    @staticmethod
+    def _file_matches_path(rel: str, path_filter: str) -> bool:
+        """路径过滤：子串匹配；以 ``/`` 结尾时仅匹配该目录前缀（如 ``nemu/``）。"""
+        r = rel.replace("\\", "/")
+        p = path_filter.replace("\\", "/").strip()
+        if not p:
+            return True
+        rl = r.lower()
+        pl = p.lower()
+        if p.endswith("/"):
+            prefix = pl.rstrip("/") + "/"
+            return rl.startswith(prefix) or f"/{prefix}" in rl
+        return pl in rl
+
+    def _symbols_matching_path(self, path_filter: str) -> list[Symbol]:
+        """收集文件路径匹配 path_filter 的所有已索引符号。"""
+        out: list[Symbol] = []
+        for rel, syms in self._by_file.items():
+            if self._file_matches_path(rel, path_filter):
+                out.extend(syms)
+        return out
+
+    def _search_path_via_grep(self, path_filter: str, name: str, limit: int) -> list[Symbol]:
+        """索引未覆盖该路径时（如已截断），在磁盘上按路径+符号名回退搜索。"""
+        if not _IDENT_RE.match(name):
             return []
-        ql = q.lower()
+        found = self._grep_definitions(name)
+        pool = [s for s in found if self._file_matches_path(s.file, path_filter)]
+        return self._rank_symbols_by_name(pool, name, limit)
+
+    def search(self, query: str, limit: int = 40) -> list[Symbol]:
+        """按名称模糊搜索符号；可用 ``in:<路径> <名>`` 限定文件范围。"""
+        self.build()
+        path_filter, name_q = self.parse_search_query(query)
+        if path_filter is not None:
+            pool = self._symbols_matching_path(path_filter)
+            if pool:
+                return self._rank_symbols_by_name(pool, name_q, limit)
+            # 索引截断或未收录该目录时，仍可在指定路径下 grep
+            if name_q:
+                return self._search_path_via_grep(path_filter, name_q, limit)
+            return []
+
+        if not name_q:
+            return []
+        ql = name_q.lower()
         exact: list[Symbol] = []
         prefix: list[Symbol] = []
         substr: list[Symbol] = []

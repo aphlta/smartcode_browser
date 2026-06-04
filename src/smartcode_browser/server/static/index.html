@@ -15,7 +15,7 @@
       <select id="project-select" title="选择项目"></select>
 
       <div class="search-wrap">
-        <input id="search-input" type="text" placeholder="搜索函数 / 方法 / 类…" autocomplete="off" />
+        <input id="search-input" type="text" placeholder="符号名 或 in:nemu/ main" autocomplete="off" title="路径：in:nemu/ main（仅 nemu 目录）、in:nemu main（含 platform/nemu）" />
         <div id="search-results" class="search-results hidden"></div>
       </div>
 
@@ -45,7 +45,7 @@
   <main id="board" class="board">
     <div id="empty-hint" class="empty-hint">
       <h2>开始浏览</h2>
-      <p>① 选择上方项目 → ② 搜索一个函数并打开 → ③ 点击函数体内的<strong>蓝色调用</strong>，会在右侧展开它的定义。</p>
+      <p>① 选择上方项目 → ② 搜索一个函数并打开（可用 <code>in:nemu main</code> 限定路径）→ ③ 点击函数体内的<strong>蓝色调用</strong>，会在右侧展开它的定义。</p>
       <p>浏览状态会<strong>自动保存</strong>，刷新或重启后会恢复；也可点顶栏「保存到标签」把当前代码树存成书签。</p>
       <p>同一函数已在树中时会<strong>复用面板</strong>；按住 <kbd>Shift</kbd> 点击可强制新开。</p>
       <p><strong>拖动</strong>标题栏可移动面板，其余子面板会自动避让重排；<strong>双击</strong>标题栏恢复自动布局。</p>
@@ -81,6 +81,6 @@
     <div id="ai-status" class="ai-status"></div>
   </aside>
 
-  <script src="/static/app.js?v=20260604"></script>
+  <script src="/static/app.js?v=20260604b"></script>
 </body>
 </html>

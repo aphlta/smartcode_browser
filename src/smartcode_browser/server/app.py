@@ -60,7 +60,7 @@ def create_app(engine: CodeEngine | None = None) -> FastAPI:
         q: str = Query(..., min_length=1),
         limit: int = Query(40, ge=1, le=200),
     ) -> list[dict]:
-        """按名称模糊搜索符号。"""
+        """按名称模糊搜索符号；支持 ``in:<路径> <名>`` 限定文件范围。"""
         try:
             return engine.search(project, q, limit)
         except KeyError as exc:
