@@ -9,13 +9,31 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import asyncio
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from ..engine import CodeEngine
+from .llm import chat_analyze, llm_configured, llm_settings
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+class AiChatRequest(BaseModel):
+    project: str
+    file: str
+    function_name: str
+    start_line: int
+    end_line: int = 0
+    signature: str = ""
+    source: str = Field(..., max_length=120_000)
+    selected_text: str = Field("", max_length=32_000)
+    question: str = Field(..., min_length=1, max_length=16_000)
+    history: list[dict[str, str]] = Field(default_factory=list)
+    chat_id: str = ""
 
 
 def create_app(engine: CodeEngine | None = None) -> FastAPI:
@@ -101,6 +119,38 @@ def create_app(engine: CodeEngine | None = None) -> FastAPI:
             return engine.find_usages(project, name, limit)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/ai/config")
+    def ai_config() -> dict:
+        """前端用于判断是否展示 AI 功能及当前模型名。"""
+        s = llm_settings()
+        return {"configured": s["configured"], "backend": s["backend"], "model": s["model"]}
+
+    @app.post("/api/ai/chat")
+    async def ai_chat(req: AiChatRequest) -> JSONResponse:
+        """对当前函数/选中代码发起 LLM 分析。"""
+        if not llm_configured():
+            raise HTTPException(
+                status_code=503,
+                detail="未配置 cursor-agent，请先安装并 login（cursor-agent login）",
+            )
+        try:
+            project = engine.registry.get(req.project)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        try:
+            text, chat_id = await asyncio.to_thread(
+                chat_analyze, req.model_dump(), Path(project.root)
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "reply": text,
+                "chat_id": chat_id,
+                "model": llm_settings()["model"],
+            }
+        )
 
     @app.get("/")
     def index() -> FileResponse:

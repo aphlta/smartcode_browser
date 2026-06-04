@@ -43,9 +43,14 @@ SMARTCODE_BROWSER_PORT=8780 .venv/bin/smartcode-browser
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `SMARTCODE_BROWSER_HOST` | `127.0.0.1` | 监听地址；远程访问设为 `0.0.0.0` |
+| `SMARTCODE_BROWSER_HOST` | `127.0.0.1` | 监听地址 |
 | `SMARTCODE_BROWSER_PORT` | `8765` | 端口 |
-| `SMARTCODE_BROWSER_REGISTRY` | 见下方 | 项目注册表 YAML 路径 |
+| `SMARTCODE_BROWSER_REGISTRY` | 见 README | 项目注册表 YAML |
+| `SMARTCODE_CURSOR_CLI_BIN` | `cursor-agent` | cursor-agent 可执行文件路径 |
+| `SMARTCODE_CURSOR_MODEL` | `composer-2.5` | cursor-agent 使用的模型 |
+| `SMARTCODE_CURSOR_TIMEOUT` | `600` | 单次 AI 分析超时（秒） |
+
+AI 分析依赖 **cursor-agent** 及其登录态，请先安装 CLI 并执行 `cursor-agent login`（无需配置 OpenAI API Key）。
 
 注册表查找顺序：`SMARTCODE_BROWSER_REGISTRY` → `./projects/registry.yaml` → 包旁 `projects/registry.yaml` → `/etc/smartcode/registry.yaml` → 内置演示（浏览本包源码）。
 

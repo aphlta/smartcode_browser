@@ -12,11 +12,15 @@ const state = {
   order: [],         // 维持插入顺序，决定同列内的堆叠次序
   seq: 0,            // panel id 自增
   _restoring: false, // 恢复会话时跳过自动保存，避免写入半成品
+  aiConfigured: false,
+  aiModel: "",
+  ai: null, // { panelId, threadId, selectedText }
 };
 
-// localStorage 键：上次会话 + 用户命名的标签书签
+// localStorage 键：上次会话 + 用户命名的标签书签 + AI 分析记录
 const LS_SESSION = "smartcode-browser-session-v1";
 const LS_BOOKMARKS = "smartcode-browser-bookmarks-v1";
+const LS_AI = "smartcode-browser-ai-v1";
 
 const el = {
   projectSelect: document.getElementById("project-select"),
@@ -31,6 +35,17 @@ const el = {
   bookmarkNameInput: document.getElementById("bookmark-name-input"),
   bookmarkSaveOk: document.getElementById("bookmark-save-ok"),
   bookmarkSaveCancel: document.getElementById("bookmark-save-cancel"),
+  codeCtxMenu: document.getElementById("code-ctx-menu"),
+  aiDrawer: document.getElementById("ai-drawer"),
+  aiDrawerTitle: document.getElementById("ai-drawer-title"),
+  aiDrawerSub: document.getElementById("ai-drawer-sub"),
+  aiDrawerClose: document.getElementById("ai-drawer-close"),
+  aiThreadList: document.getElementById("ai-thread-list"),
+  aiNewThread: document.getElementById("ai-new-thread"),
+  aiMessages: document.getElementById("ai-messages"),
+  aiInput: document.getElementById("ai-input"),
+  aiSend: document.getElementById("ai-send"),
+  aiStatus: document.getElementById("ai-status"),
 };
 
 // ---------- 工具 ----------
@@ -60,6 +75,17 @@ async function api(path, params) {
     throw new Error(detail.detail || resp.statusText);
   }
   return resp.json();
+}
+
+async function apiPost(path, body) {
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const detail = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(detail.detail || resp.statusText);
+  return detail;
 }
 
 // ---------- 会话持久化（刷新/重启后自动恢复 + 命名标签） ----------
@@ -292,6 +318,7 @@ async function loadProjects() {
     el.projectSelect.appendChild(opt);
   });
   renderBookmarkList();
+  await loadAiConfig();
 
   // 优先恢复上次浏览的代码树；无记录时再选默认项目
   const restored = await tryRestoreLastSession(projects);
@@ -1057,8 +1084,13 @@ function renderPanel(panel) {
     `<span class="fn">${escapeHtml(d.name)}</span>` +
     `<span class="kind">${escapeHtml(d.kind)}</span>` +
     `<span class="file" title="${escapeHtml(d.file)}">${escapeHtml(d.file)}:${d.start_line}</span>` +
+    `<span class="ai-open" title="AI 分析此函数">✦${hasAiNotes(d) ? '<i class="ai-dot"></i>' : ""}</span>` +
     `<span class="close" title="关闭此面板及右侧分支">×</span>`;
   header.querySelector(".close").onclick = (e) => { e.stopPropagation(); closePanel(panel.id); };
+  header.querySelector(".ai-open").onclick = (e) => {
+    e.stopPropagation();
+    openAiDrawer(panel.id, { selectedText: "" });
+  };
   setupPanelDrag(header, panel.id);
   node.appendChild(header);
   if (panel.manualPos) node.classList.add("manual-pos");
@@ -1092,8 +1124,12 @@ function renderPanel(panel) {
     if (t) { e.stopPropagation(); navFromToken(panel.id, t, e); }
   });
   code.addEventListener("contextmenu", (e) => {
+    // 任意右键均弹出菜单（含 AI），不再要求先选中代码
+    e.preventDefault();
+    e.stopPropagation();
+    const sel = window.getSelection()?.toString().trim();
     const t = e.target.closest(".tok, .ref");
-    if (t) { e.preventDefault(); e.stopPropagation(); navFromToken(panel.id, t, e); }
+    showCodeContextMenu(e, panel.id, sel || "", t);
   });
   node.appendChild(code);
   return node;
@@ -1198,6 +1234,308 @@ function drawConnectors() {
   }
 }
 
+// ---------- AI 分析（右键 / 面板 ✦ → 侧栏对话，按函数 localStorage 持久化） ----------
+
+let codeCtxState = null;
+
+function aiSymbolKey(detail) {
+  return `${state.project}:${detail.file}:${detail.start_line}:${detail.name}`;
+}
+
+function loadAiStore() {
+  try { return JSON.parse(localStorage.getItem(LS_AI)) || {}; }
+  catch { return {}; }
+}
+
+function saveAiStore(store) {
+  localStorage.setItem(LS_AI, JSON.stringify(store));
+}
+
+function getAiRecord(detail) {
+  const store = loadAiStore();
+  return store[aiSymbolKey(detail)] || null;
+}
+
+function hasAiNotes(detail) {
+  const rec = getAiRecord(detail);
+  if (!rec?.threads?.length) return false;
+  return rec.threads.some((t) => t.messages?.length > 0);
+}
+
+function ensureAiRecord(detail) {
+  const store = loadAiStore();
+  const key = aiSymbolKey(detail);
+  if (!store[key]) {
+    store[key] = {
+      symbol: {
+        file: detail.file, name: detail.name,
+        start_line: detail.start_line, end_line: detail.end_line,
+      },
+      project: state.project,
+      threads: [],
+    };
+  }
+  return store[key];
+}
+
+function persistAiRecord(detail, record) {
+  const store = loadAiStore();
+  store[aiSymbolKey(detail)] = record;
+  saveAiStore(store);
+}
+
+function threadTitle(thread) {
+  const first = thread.messages.find((m) => m.role === "user");
+  if (!first) return "空对话";
+  const t = first.content.replace(/\s+/g, " ").trim();
+  return t.length > 36 ? t.slice(0, 36) + "…" : t;
+}
+
+function closeCodeContextMenu() {
+  el.codeCtxMenu.classList.add("hidden");
+  codeCtxState = null;
+}
+
+function showCodeContextMenu(ev, panelId, selectedText, tokenEl) {
+  closeCodeContextMenu();
+  codeCtxState = { panelId, selectedText, tokenEl };
+  const menu = el.codeCtxMenu;
+  menu.querySelector('[data-action="usages"]').classList.toggle(
+    "hidden", !tokenEl
+  );
+  if (!state.aiConfigured) {
+    menu.querySelector('[data-action="ai"]').textContent = "✦ AI 分析（未配置 cursor-agent，请先 login）";
+  } else if (selectedText) {
+    menu.querySelector('[data-action="ai"]').textContent = "✦ AI 分析选中代码";
+  } else {
+    menu.querySelector('[data-action="ai"]').textContent = "✦ AI 分析整个函数";
+  }
+  menu.classList.remove("hidden");
+  menu.style.left = Math.min(ev.clientX, window.innerWidth - 200) + "px";
+  menu.style.top = ev.clientY + "px";
+  setTimeout(() => document.addEventListener("click", closeCodeContextMenu, { once: true }), 0);
+}
+
+function formatAiText(text) {
+  // 简单 markdown：代码块 + 换行（不做完整 MD 解析，避免 XSS）
+  const parts = text.split(/```/);
+  let html = "";
+  parts.forEach((part, i) => {
+    if (i % 2 === 1) {
+      html += `<pre class="ai-code">${escapeHtml(part.replace(/^\w*\n/, ""))}</pre>`;
+    } else {
+      html += escapeHtml(part).replace(/\n/g, "<br>");
+    }
+  });
+  return html;
+}
+
+function renderAiUi() {
+  if (!state.ai) return;
+  const panel = state.panels.get(state.ai.panelId);
+  if (!panel?.detail) return;
+  const d = panel.detail;
+  const record = ensureAiRecord(d);
+  persistAiRecord(d, record);
+
+  el.aiDrawerTitle.textContent = `AI · ${d.name}`;
+  el.aiDrawerSub.textContent = `${d.file}:${d.start_line}`;
+  if (state.ai.selectedText) {
+    el.aiDrawerSub.textContent += " · 已选中片段";
+  }
+
+  el.aiThreadList.innerHTML = "";
+  record.threads.forEach((th) => {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "ai-thread-pill" + (th.id === state.ai.threadId ? " active" : "");
+    pill.textContent = threadTitle(th);
+    pill.title = threadTitle(th);
+    pill.onclick = () => {
+      state.ai.threadId = th.id;
+      renderAiUi();
+    };
+    el.aiThreadList.appendChild(pill);
+  });
+
+  const thread = record.threads.find((t) => t.id === state.ai.threadId);
+  el.aiMessages.innerHTML = "";
+  if (!thread || !thread.messages.length) {
+    el.aiMessages.innerHTML =
+      `<div class="ai-hint">可问：这里几种时序/分支情况？多核下可能有什么问题？如何验证？</div>`;
+  } else {
+    thread.messages.forEach((m) => {
+      const div = document.createElement("div");
+      div.className = `ai-msg ai-msg-${m.role}`;
+      const meta = document.createElement("div");
+      meta.className = "ai-msg-meta";
+      meta.textContent = m.role === "user" ? "你" : "AI";
+      const body = document.createElement("div");
+      body.className = "ai-msg-body";
+      body.innerHTML = formatAiText(m.content);
+      div.appendChild(meta);
+      div.appendChild(body);
+      el.aiMessages.appendChild(div);
+    });
+    el.aiMessages.scrollTop = el.aiMessages.scrollHeight;
+  }
+
+  if (state.aiConfigured) {
+    const backend = state.aiBackend || "cursor-agent";
+    el.aiStatus.textContent = `${backend} · ${state.aiModel}`;
+  } else {
+    el.aiStatus.textContent = "请安装 cursor-agent 并 login";
+  }
+}
+
+function openAiDrawer(panelId, opts = {}) {
+  const panel = state.panels.get(panelId);
+  if (!panel?.detail) return;
+  const record = ensureAiRecord(panel.detail);
+  let threadId = opts.threadId;
+  if (!threadId) {
+    if (opts.newThread || opts.selectedText) {
+      const th = {
+        id: "th-" + Date.now(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        selectedText: opts.selectedText || "",
+        messages: [],
+      };
+      record.threads.unshift(th);
+      threadId = th.id;
+      persistAiRecord(panel.detail, record);
+    } else if (record.threads.length) {
+      threadId = record.threads[0].id;
+    } else {
+      const th = {
+        id: "th-" + Date.now(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        selectedText: "",
+        messages: [],
+      };
+      record.threads.unshift(th);
+      threadId = th.id;
+      persistAiRecord(panel.detail, record);
+    }
+  }
+  state.ai = {
+    panelId,
+    threadId,
+    selectedText: opts.selectedText || "",
+  };
+  document.body.classList.add("ai-open");
+  el.aiDrawer.classList.remove("hidden");
+  renderAiUi();
+  refreshAiPanelBadge(panelId);
+  if (opts.prefill) el.aiInput.value = opts.prefill;
+  el.aiInput.focus();
+}
+
+function closeAiDrawer() {
+  el.aiDrawer.classList.add("hidden");
+  document.body.classList.remove("ai-open");
+  state.ai = null;
+}
+
+function refreshAiPanelBadge(panelId) {
+  const panel = state.panels.get(panelId);
+  const node = panel?.el?.querySelector(".ai-open");
+  if (!node || !panel.detail) return;
+  const dot = node.querySelector(".ai-dot");
+  if (hasAiNotes(panel.detail) && !dot) {
+    node.insertAdjacentHTML("beforeend", '<i class="ai-dot"></i>');
+  }
+}
+
+function newAiThread() {
+  if (!state.ai) return;
+  openAiDrawer(state.ai.panelId, {
+    newThread: true,
+    selectedText: state.ai.selectedText || "",
+  });
+}
+
+async function sendAiMessage() {
+  if (!state.ai) return;
+  const question = el.aiInput.value.trim();
+  if (!question) return;
+  if (!state.aiConfigured) {
+    toast("未配置 cursor-agent（请先 login）");
+    return;
+  }
+
+  const panel = state.panels.get(state.ai.panelId);
+  if (!panel?.detail) return;
+  const d = panel.detail;
+  const record = ensureAiRecord(d);
+  const thread = record.threads.find((t) => t.id === state.ai.threadId);
+  if (!thread) return;
+
+  thread.messages.push({
+    role: "user", content: question, ts: new Date().toISOString(),
+  });
+  thread.updatedAt = new Date().toISOString();
+  if (state.ai.selectedText && !thread.selectedText) {
+    thread.selectedText = state.ai.selectedText;
+  }
+  persistAiRecord(d, record);
+  el.aiInput.value = "";
+  el.aiSend.disabled = true;
+  el.aiSend.textContent = "分析中…";
+  renderAiUi();
+
+  const source = d.lines.join("\n");
+  const history = thread.messages.slice(0, -1).map((m) => ({
+    role: m.role, content: m.content,
+  }));
+
+  try {
+    const resp = await apiPost("/api/ai/chat", {
+      project: state.project,
+      file: d.file,
+      function_name: d.name,
+      start_line: d.start_line,
+      end_line: d.end_line,
+      signature: d.signature || "",
+      source,
+      selected_text: state.ai.selectedText || thread.selectedText || "",
+      question,
+      history,
+      chat_id: thread.chatId || "",
+    });
+    if (resp.chat_id) thread.chatId = resp.chat_id;
+    thread.messages.push({
+      role: "assistant", content: resp.reply, ts: new Date().toISOString(),
+    });
+    thread.updatedAt = new Date().toISOString();
+    persistAiRecord(d, record);
+    refreshAiPanelBadge(state.ai.panelId);
+    renderAiUi();
+  } catch (e) {
+    toast("AI 分析失败: " + e.message);
+    thread.messages.pop();
+    persistAiRecord(d, record);
+    renderAiUi();
+  } finally {
+    el.aiSend.disabled = false;
+    el.aiSend.textContent = "发送";
+  }
+}
+
+async function loadAiConfig() {
+  try {
+    const cfg = await api("/api/ai/config");
+    state.aiConfigured = !!cfg.configured;
+    state.aiModel = cfg.model || "";
+    state.aiBackend = cfg.backend || "";
+  } catch {
+    state.aiConfigured = false;
+    state.aiBackend = "";
+  }
+}
+
 // ---------- 事件绑定 ----------
 
 el.projectSelect.addEventListener("change", (e) => setProject(e.target.value));
@@ -1215,6 +1553,35 @@ el.bookmarkNameInput.addEventListener("keydown", (e) => {
 });
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".search-wrap")) el.searchResults.classList.add("hidden");
+});
+
+el.codeCtxMenu.addEventListener("click", (e) => {
+  const item = e.target.closest(".ctx-item");
+  if (!item || !codeCtxState) return;
+  e.stopPropagation();
+  const action = item.dataset.action;
+  const { panelId, selectedText, tokenEl } = codeCtxState;
+  closeCodeContextMenu();
+  if (action === "ai") {
+    openAiDrawer(panelId, {
+      selectedText,
+      prefill: selectedText
+        ? "请分析以下选中代码可能的几种情况（时序/分支/多核）："
+        : "",
+    });
+  } else if (action === "usages" && tokenEl) {
+    navFromToken(panelId, tokenEl, { type: "contextmenu" });
+  }
+});
+
+el.aiDrawerClose.addEventListener("click", closeAiDrawer);
+el.aiNewThread.addEventListener("click", newAiThread);
+el.aiSend.addEventListener("click", sendAiMessage);
+el.aiInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    sendAiMessage();
+  }
 });
 
 // 页面关闭前立即写入，减少刷新时丢失最后一帧改动的概率
