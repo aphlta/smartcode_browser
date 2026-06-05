@@ -336,6 +336,7 @@ async function refreshProjectStats(id) {
   try {
     const s = await api("/api/stats", { project: id });
     el.stats.textContent = `${s.files_indexed} 文件 · ${s.symbols} 符号` +
+      (s.from_cache ? " · 缓存" : "") +
       (s.truncated ? " · 已截断" : "");
   } catch (e) {
     el.stats.textContent = "索引失败: " + e.message;
@@ -417,7 +418,8 @@ function insertPanel(detail, parentId, fromRef, id) {
   };
   state.panels.set(id, panel);
   state.order.push(id);
-  if (parent && fromRef) {
+  // 函数指针成员调用可多次展开不同目标，不占用 childByRef（避免再次点击只聚焦）
+  if (parent && fromRef && fromRef.refKind !== "member") {
     parent.childByRef = parent.childByRef || {};
     parent.childByRef[refKey(fromRef)] = id;
   }
@@ -534,22 +536,41 @@ async function navFromToken(panelId, el, ev) {
   const name = el.dataset.name;
   const line = parseInt(el.dataset.line, 10);
   const col = parseInt(el.dataset.col, 10);
-  const fromRef = { name, line, col };
+  const fromRef = {
+    name, line, col,
+    receiver: el.dataset.receiver || "",
+    refKind: el.dataset.refKind || "",
+  };
+  const isMemberFp = fromRef.refKind === "member";
 
   if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.type === "contextmenu") {
     return openUsages(panelId, fromRef, el);
   }
 
-  // 同一来源已展开 → 聚焦
-  const existingId = panel.childByRef && panel.childByRef[refKey(fromRef)];
-  if (existingId && state.panels.has(existingId)) { focusPanel(existingId); return; }
+  // 同一来源已展开 → 聚焦（函数指针成员调用除外：可多次展开不同 handler）
+  if (!isMemberFp) {
+    const existingId = panel.childByRef && panel.childByRef[refKey(fromRef)];
+    if (existingId && state.panels.has(existingId)) { focusPanel(existingId); return; }
+  }
 
   let cands = [];
   try {
     if (el.classList.contains("ref")) {
-      cands = await api("/api/resolve", {
-        project: state.project, name, from_file: panel.detail.file,
-      });
+      const receiver = el.dataset.receiver || "";
+      if (receiver && el.dataset.refKind === "member") {
+        cands = await api("/api/resolve_call", {
+          project: state.project,
+          file: panel.detail.file,
+          name,
+          line,
+          col,
+          receiver,
+        });
+      } else {
+        cands = await api("/api/resolve", {
+          project: state.project, name, from_file: panel.detail.file,
+        });
+      }
     } else {
       cands = await api("/api/resolve_at", {
         project: state.project, file: panel.detail.file, name, line, col,
@@ -561,9 +582,9 @@ async function navFromToken(panelId, el, ev) {
     toast(`无法解析 ${name}（外部库/宏/未声明，或仅在更外层作用域）`);
     return;
   }
-  if (cands.length === 1) {
+  if (cands.length === 1 && !isMemberFp) {
     await openCandidate(panelId, fromRef, cands[0], ev.shiftKey);
-  } else {
+  } else if (cands.length >= 1) {
     showCandidateMenu(panelId, fromRef, el, cands);
   }
 }
@@ -574,11 +595,12 @@ async function openCandidate(panelId, ref, cand, forceNew = false) {
     flashLine(panelId, cand.line);
     return;
   }
+  const memberFp = ref.refKind === "member";
   try {
     const detail = await fetchSymbol(cand.file, cand.name, cand.line);
     if (!detail) { toast("目标源码不可读"); return; }
-    // 同一函数已在树中 → 复用面板并追加来源连线（Shift+点击 强制新开）
-    if (!forceNew) {
+    // 函数指针：每次选择都新开子面板；普通调用仍可复用已有面板（Shift 强制新开）
+    if (!forceNew && !memberFp) {
       const existingId = findPanelBySymbol(detail);
       if (existingId && existingId !== panelId) {
         linkPanelFrom(panelId, ref, existingId);
@@ -697,6 +719,13 @@ function showCandidateMenu(panelId, ref, anchorEl, candidates) {
   const menu = document.createElement("div");
   menu.className = "cand-menu";
   menu.id = "cand-menu";
+  const recv = anchorEl.dataset.receiver;
+  if (recv && candidates.length > 1) {
+    const head = document.createElement("div");
+    head.className = "cand-menu-head";
+    head.textContent = `${recv} · ${ref.name}（${candidates.length} 个实现，表项可能在其它 .c）`;
+    menu.appendChild(head);
+  }
   candidates.forEach((c) => {
     const item = document.createElement("div");
     item.className = "citem";
@@ -1109,7 +1138,9 @@ function renderPanel(panel) {
   const code = document.createElement("div");
   code.className = "panel-code";
   const callCols = {};
-  d.references.forEach((r) => { (callCols[r.line] = callCols[r.line] || new Set()).add(r.col); });
+  d.references.forEach((r) => {
+    (callCols[r.line] = callCols[r.line] || new Map()).set(r.col, r);
+  });
 
   d.lines.forEach((text, idx) => {
     const lineNo = d.start_line + idx;
@@ -1139,7 +1170,7 @@ function renderPanel(panel) {
 }
 
 // 将一行按标识符分词：每个标识符包成可点击 span（调用蓝色，其余中性）
-function renderLine(text, callColSet, lineNo) {
+function renderLine(text, callColMap, lineNo) {
   let html = "";
   let cursor = 0;
   const re = /[A-Za-z_]\w*/g;
@@ -1149,10 +1180,15 @@ function renderLine(text, callColSet, lineNo) {
     html += escapeHtml(text.slice(cursor, s));
     cursor = s + word.length;
     if (KEYWORDS.has(word)) { html += escapeHtml(word); continue; }
-    const isCall = callColSet && callColSet.has(col);
-    const cls = isCall ? "ref" : "tok";
-    html += `<span class="${cls}" data-name="${escapeHtml(word)}" ` +
-      `data-line="${lineNo}" data-col="${col}">${escapeHtml(word)}</span>`;
+    const meta = callColMap && callColMap.get(col);
+    const isCall = !!meta;
+    let cls = isCall ? "ref" : "tok";
+    if (meta && meta.ref_kind === "member") cls += " ref-member";
+    let attrs = `data-name="${escapeHtml(word)}" data-line="${lineNo}" data-col="${col}"`;
+    if (meta && meta.receiver) {
+      attrs += ` data-receiver="${escapeHtml(meta.receiver)}" data-ref-kind="member"`;
+    }
+    html += `<span class="${cls}" ${attrs}>${escapeHtml(word)}</span>`;
   }
   html += escapeHtml(text.slice(cursor));
   return html;

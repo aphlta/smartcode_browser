@@ -28,7 +28,7 @@ class CodeEngine:
     def _index(self, project_id: str) -> SymbolIndex:
         if project_id not in self._indexes:
             project = self.registry.get(project_id)
-            self._indexes[project_id] = SymbolIndex(project)
+            self._indexes[project_id] = SymbolIndex(project, project_id)
         return self._indexes[project_id]
 
     # --- 项目 ---
@@ -92,6 +92,8 @@ class CodeEngine:
                 end_col=ref.end_col,
                 resolved=True,
                 candidates=[],
+                ref_kind=ref.ref_kind,
+                receiver=ref.receiver,
             )
             for ref in raw_refs
         ]
@@ -109,6 +111,54 @@ class CodeEngine:
         )
 
     # --- 解析引用 ---
+
+    def resolve_call(
+        self,
+        project_id: str,
+        file: str,
+        line: int,
+        col: int,
+        name: str,
+        receiver: str = "",
+    ) -> list[dict]:
+        """解析成员/函数指针调用（如 ``cmd_table[i].handler()``）。
+
+        从项目内静态表初始化收集该字段上的全部 handler（定义可在其它 .c）。
+        """
+        index = self._index(project_id)
+        project = self.registry.get(project_id)
+        adapter = index.adapter_for(file)
+        if adapter is None:
+            return []
+        targets: list[str] = []
+        if receiver and hasattr(adapter, "find_table_field_targets_scoped"):
+            targets = adapter.find_table_field_targets_scoped(  # type: ignore[attr-defined]
+                project.root,
+                receiver,
+                name,
+                prefer_file=file,
+                exclude_dirs=project.exclude_dirs,
+            )
+        elif receiver and hasattr(adapter, "find_table_field_targets"):
+            source = self._read_bytes(project, file)
+            if source is not None:
+                targets = adapter.find_table_field_targets(  # type: ignore[attr-defined]
+                    source, file, receiver, name
+                )
+        if not targets:
+            return self.resolve(project_id, name, file)
+
+        symbols: list[Symbol] = []
+        seen: set[tuple[str, int]] = set()
+        for fn in targets:
+            for s in self._merged_candidates(index, fn):
+                key = (s.file, s.start_line)
+                if key in seen:
+                    continue
+                seen.add(key)
+                symbols.append(s)
+        ranked = self._rank_definitions(symbols, file)
+        return [d.to_dict() for d in ranked]
 
     def resolve(self, project_id: str, name: str, from_file: str = "") -> list[dict]:
         """把一个引用名解析为**全部**候选定义并排序。

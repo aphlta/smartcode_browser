@@ -48,6 +48,9 @@ class Reference:
     line: int  # 出现行（1-based）
     col: int  # 起始列（1-based）
     end_col: int  # 结束列（1-based，用于前端精确高亮可点击区域）
+    # member：成员/函数指针调用（如 cmd_table[i].handler()），需结合 receiver 解析
+    ref_kind: str = "direct"
+    receiver: str = ""  # 表或对象根标识符（如 cmd_table）
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -86,6 +89,8 @@ class ResolvedReference:
     end_col: int
     resolved: bool
     candidates: list[Definition] = field(default_factory=list)
+    ref_kind: str = "direct"
+    receiver: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -95,6 +100,8 @@ class ResolvedReference:
             "end_col": self.end_col,
             "resolved": self.resolved,
             "candidates": [c.to_dict() for c in self.candidates],
+            "ref_kind": self.ref_kind,
+            "receiver": self.receiver,
         }
 
 

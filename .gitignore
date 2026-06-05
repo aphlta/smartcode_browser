@@ -11,6 +11,9 @@ build/
 # 本地项目配置（含机器绝对路径，勿提交）
 projects/registry.yaml
 
+# 符号索引磁盘缓存（可选 SMARTCODE_BROWSER_CACHE 指向仓库内时）
+.cache/
+
 # IDE / OS
 .idea/
 .vscode/

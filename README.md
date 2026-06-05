@@ -49,6 +49,7 @@ SMARTCODE_BROWSER_PORT=8780 .venv/bin/smartcode-browser
 | `SMARTCODE_CURSOR_CLI_BIN` | `cursor-agent` | cursor-agent 可执行文件路径 |
 | `SMARTCODE_CURSOR_MODEL` | `composer-2.5` | cursor-agent 使用的模型 |
 | `SMARTCODE_CURSOR_TIMEOUT` | `600` | 单次 AI 分析超时（秒） |
+| `SMARTCODE_BROWSER_CACHE` | `~/.cache/smartcode-browser` | 符号索引磁盘缓存目录；设为 `off` 禁用 |
 
 AI 分析依赖 **cursor-agent** 及其登录态，请先安装 CLI 并执行 `cursor-agent login`（无需配置 OpenAI API Key）。
 

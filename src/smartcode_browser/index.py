@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 
 from .adapters import LanguageAdapter, get_adapter
+from .index_cache import file_stamp, save as save_index_cache, try_load as try_load_index_cache
 from .models import Symbol
 from .registry import Project
 
@@ -33,8 +34,9 @@ _IDENT_RE = re.compile(r"^[A-Za-z_]\w+$")
 class SymbolIndex:
     """单个项目的符号索引。"""
 
-    def __init__(self, project: Project) -> None:
+    def __init__(self, project: Project, project_id: str = "") -> None:
         self.project = project
+        self.project_id = project_id or project.root.name
         self._adapters = self._build_adapters(project)
         self._by_name: dict[str, list[Symbol]] = {}
         self._by_file: dict[str, list[Symbol]] = {}
@@ -42,6 +44,7 @@ class SymbolIndex:
         self._lock = threading.Lock()
         self._file_count = 0
         self._truncated = False
+        self._from_disk_cache = False
         # 全局回退解析的结果缓存（含负缓存：值为空列表表示确实没找到）
         self._global_cache: dict[str, list[Symbol]] = {}
         self._global_lock = threading.Lock()
@@ -97,19 +100,46 @@ class SymbolIndex:
                         yield rel
 
     def build(self) -> None:
-        """惰性构建索引（线程安全，幂等）。"""
+        """惰性构建索引（线程安全，幂等）；优先加载磁盘缓存。"""
         if self._built:
             return
         with self._lock:
             if self._built:
                 return
+            cached = try_load_index_cache(
+                self.project, self.project_id, _MAX_FILES
+            )
+            if cached is not None:
+                self._by_name = cached.by_name
+                self._by_file = cached.by_file
+                self._file_count = cached.file_count
+                self._truncated = cached.truncated
+                self._from_disk_cache = True
+                self._built = True
+                return
+
+            manifest: dict[str, tuple[float, int]] = {}
             for rel in self._iter_source_files():
                 if self._file_count >= _MAX_FILES:
                     self._truncated = True
                     break
+                full = self.project.root / rel
+                stamp = file_stamp(full)
+                if stamp is not None:
+                    manifest[rel] = stamp
                 self._index_file(rel)
                 self._file_count += 1
             self._built = True
+            save_index_cache(
+                self.project,
+                self.project_id,
+                _MAX_FILES,
+                manifest,
+                self._by_name,
+                self._by_file,
+                self._file_count,
+                self._truncated,
+            )
 
     def _index_file(self, rel_path: str) -> None:
         adapter = self.adapter_for(rel_path)
@@ -422,5 +452,6 @@ class SymbolIndex:
             "symbols": sum(len(v) for v in self._by_name.values()),
             "unique_names": len(self._by_name),
             "truncated": self._truncated,
+            "from_cache": self._from_disk_cache,
             "adapters": [a.name for a in self._adapters],
         }

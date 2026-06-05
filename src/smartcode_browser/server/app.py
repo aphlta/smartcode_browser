@@ -94,6 +94,21 @@ def create_app(engine: CodeEngine | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/resolve_call")
+    def resolve_call(
+        project: str = Query(...),
+        file: str = Query(...),
+        name: str = Query(...),
+        line: int = Query(..., ge=1),
+        col: int = Query(0, ge=0),
+        receiver: str = Query(""),
+    ) -> list[dict]:
+        """解析成员/函数指针调用，列出表初始化中的全部目标函数。"""
+        try:
+            return engine.resolve_call(project, file, line, col, name, receiver)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/resolve_at")
     def resolve_at(
         project: str = Query(...),

@@ -10,6 +10,10 @@
 
 from __future__ import annotations
 
+import re
+import subprocess
+from pathlib import Path
+
 import tree_sitter as ts
 
 from ..models import Reference, Symbol
@@ -43,11 +47,23 @@ class CAdapter(TreeSitterAdapter, LanguageAdapter):
         tree = self.parse(source)
         symbols: list[Symbol] = []
 
+        seen_funcs: set[tuple[str, int]] = set()
+
+        def _add_function(sym: Symbol | None) -> None:
+            if sym is None:
+                return
+            key = (sym.name, sym.start_line)
+            if key in seen_funcs:
+                return
+            seen_funcs.add(key)
+            symbols.append(sym)
+
         for node in self.walk(tree.root_node):
             if node.type == "function_definition":
-                sym = self._symbol_from_function(source, rel_path, node)
-                if sym is not None:
-                    symbols.append(sym)
+                _add_function(self._symbol_from_function(source, rel_path, node))
+            elif node.type == "ERROR":
+                # 宏/IFDEF 等常使 tree-sitter 把整段函数标成 ERROR，仍需可导航
+                _add_function(self._symbol_from_error_function(source, rel_path, node))
             elif node.type in ("preproc_function_def", "preproc_def"):
                 # #define FOO ... / #define FOO(x) ... —— 内核大量函数其实是宏
                 sym = self._symbol_from_macro(source, rel_path, node)
@@ -226,16 +242,124 @@ class CAdapter(TreeSitterAdapter, LanguageAdapter):
         name = self.node_text(source, name_node)
         if not name or name in _C_NON_CALLS:
             return None
+        name_line = name_node.start_point[0] + 1
+        parser_end = node.end_point[0] + 1
+        if node.type == "ERROR":
+            end_line = self._function_end_line_braced(source, node, name_node)
+        else:
+            # INSTPAT/宏等常使 tree-sitter 提前结束函数体，用源码行界拉长范围
+            extended = self._end_line_before_next_toplevel_fn(source, name_line)
+            end_line = max(parser_end, extended)
         return Symbol(
             name=name,
             kind="function",
             file=rel_path,
-            start_line=node.start_point[0] + 1,
-            end_line=node.end_point[0] + 1,
-            signature=self._signature(source, node),
+            start_line=name_line,
+            end_line=end_line,
+            signature=self._signature_for_node(source, node, name_node),
             doc=self._doc_comment(source, node),
             empty=self._is_empty_body(node),
         )
+
+    def _symbol_from_error_function(
+        self, source: bytes, rel_path: str, node: ts.Node
+    ) -> Symbol | None:
+        """从 ERROR 节点恢复函数符号（NEMU 里 static 函数常落在此类节点）。"""
+        name_node = self._function_name_node(node)
+        if name_node is None:
+            return None
+        name = self.node_text(source, name_node)
+        if not name or name in _C_NON_CALLS:
+            return None
+        # 必须在函数名后不远处出现 ``{``，避免把随机 ERROR 块误当函数
+        after = source[name_node.end_byte : name_node.end_byte + 200]
+        brace_at = after.find(b"{")
+        if brace_at < 0 or brace_at > 150:
+            return None
+        return self._symbol_from_function(source, rel_path, node)
+
+    @staticmethod
+    def _line_at_byte(source: bytes, byte_off: int) -> int:
+        return source[:byte_off].count(b"\n") + 1
+
+    def _matching_brace_byte(
+        self, source: bytes, from_byte: int, limit_byte: int
+    ) -> int | None:
+        """从 from_byte 起找第一个 ``{``，返回与之匹配的 ``}`` 的字节下标。"""
+        chunk = source[from_byte:limit_byte]
+        start = chunk.find(b"{")
+        if start < 0:
+            return None
+        depth = 0
+        for i in range(start, len(chunk)):
+            b = chunk[i]
+            if b == ord("{"):
+                depth += 1
+            elif b == ord("}"):
+                depth -= 1
+                if depth == 0:
+                    return from_byte + i
+        return None
+
+    def _function_end_line_braced(
+        self, source: bytes, node: ts.Node, name_node: ts.Node
+    ) -> int:
+        # ERROR 节点内常有 #ifdef，括号计数不可靠，用下一函数定义定位结尾
+        if node.type != "ERROR":
+            after = source[name_node.end_byte : min(name_node.end_byte + 300, node.end_byte)]
+            paren = after.find(b")")
+            region_start = name_node.end_byte + (paren if paren >= 0 else 0)
+            close = self._matching_brace_byte(source, region_start, node.end_byte)
+            if close is not None:
+                return self._line_at_byte(source, close)
+        name_line = name_node.start_point[0] + 1
+        return self._end_line_before_next_toplevel_fn(
+            source, name_line, search_until=node.end_point[0] + 1
+        )
+
+    def _end_line_before_next_toplevel_fn(
+        self,
+        source: bytes,
+        name_line: int,
+        search_until: int | None = None,
+    ) -> int:
+        """从 name_line 起找下一顶格函数定义，向前定位闭合 ``}`` 作为函数结束行。
+
+        用于纠正 tree-sitter 在宏展开（INSTPAT 等）处截断 function_definition 的问题。
+        """
+        lines = source.decode("utf-8", errors="replace").splitlines()
+        limit = min(search_until or len(lines), len(lines))
+        for line_no in range(name_line + 1, min(name_line + 500, limit + 1)):
+            if line_no > len(lines):
+                break
+            raw = lines[line_no - 1]
+            if raw.startswith((" ", "\t", "#")):
+                continue
+            stripped = raw.lstrip()
+            if not stripped.startswith(
+                ("static ", "void ", "int ", "bool ", "inline ")
+            ):
+                continue
+            if "(" not in raw:
+                continue
+            for back in range(line_no - 1, name_line, -1):
+                if lines[back - 1].strip() == "}":
+                    return back
+            return line_no - 1
+        return min(name_line + 80, limit)
+
+    def _signature_for_node(
+        self, source: bytes, node: ts.Node, name_node: ts.Node
+    ) -> str:
+        body = node.child_by_field_name("body")
+        if body is not None:
+            return self._signature(source, node)
+        close = self._matching_brace_byte(
+            source, name_node.end_byte, node.end_byte
+        )
+        end_byte = (close + 1) if close is not None else node.end_byte
+        text = source[node.start_byte : end_byte].decode("utf-8", errors="replace")
+        return " ".join(text.split()).strip()[:200]
 
     def _is_empty_body(self, func_def: ts.Node) -> bool:
         """判断函数体是否为空（即 `{ }`，典型的 #ifdef 空桩）。
@@ -287,23 +411,267 @@ class CAdapter(TreeSitterAdapter, LanguageAdapter):
             if not self.overlaps(node, start_line, end_line):
                 continue
             fn = node.child_by_field_name("function")
-            # 只处理「直接具名调用」foo()；a->b()/结构体成员调用解析意义有限，跳过
-            if fn is None or fn.type != "identifier":
+            if fn is None:
                 continue
-            name = self.node_text(source, fn)
+            ref_kind = "direct"
+            receiver = ""
+            name_node = fn
+            if fn.type == "identifier":
+                name = self.node_text(source, fn)
+            elif fn.type == "field_expression":
+                # cmd_table[i].handler(args)：函数指针成员调用
+                field = fn.child_by_field_name("field")
+                if field is None:
+                    continue
+                name_node = field
+                name = self.node_text(source, field)
+                recv = self._root_identifier_from_expr(
+                    fn.child_by_field_name("argument"), source
+                )
+                if not recv:
+                    continue
+                ref_kind = "member"
+                receiver = recv
+            else:
+                continue
             if not name or name in _C_NON_CALLS:
                 continue
-            line = fn.start_point[0] + 1
-            col = fn.start_point[1] + 1
-            end_col = fn.end_point[1] + 1
-            key = (name, line, col)
+            line = name_node.start_point[0] + 1
+            col = name_node.start_point[1] + 1
+            end_col = name_node.end_point[1] + 1
+            key = (name, line, col, ref_kind, receiver)
             if key in seen:
                 continue
             seen.add(key)
-            refs.append(Reference(name=name, line=line, col=col, end_col=end_col))
+            refs.append(
+                Reference(
+                    name=name,
+                    line=line,
+                    col=col,
+                    end_col=end_col,
+                    ref_kind=ref_kind,
+                    receiver=receiver,
+                )
+            )
 
         refs.sort(key=lambda r: (r.line, r.col))
         return refs
+
+    def find_table_field_targets(
+        self, source: bytes, rel_path: str, table_name: str, field_name: str
+    ) -> list[str]:
+        """从单文件 ``table[] = { ... }`` 初始化中提取字段上的函数名。"""
+        tree = self.parse(source)
+        root = tree.root_node
+        field_idx = self._field_index_in_table_declaration(
+            root, source, table_name, field_name
+        )
+        init_list = self._initializer_list_for_table(root, source, table_name)
+        if init_list is None:
+            return []
+        out: list[str] = []
+        for child in init_list.children:
+            if child.type not in ("initializer", "initializer_list"):
+                continue
+            fn = self._value_at_initializer_index(source, child, field_idx)
+            if fn and fn not in out:
+                out.append(fn)
+        return out
+
+    def find_table_field_targets_scoped(
+        self,
+        project_root: Path,
+        table_name: str,
+        field_name: str,
+        *,
+        prefer_file: str = "",
+        exclude_dirs: list[str] | None = None,
+        max_files: int = 40,
+    ) -> list[str]:
+        """在项目内查找 ``table_name`` 的定义并提取字段上的函数指针目标。
+
+        调用点与表定义常在不同 .c 文件：先查 ``prefer_file``（当前面板），
+        再用 grep 扫项目里 ``table[] = {`` 的其它文件并 tree-sitter 解析。
+        """
+        exclude = exclude_dirs or []
+        to_scan: list[str] = []
+        if prefer_file:
+            to_scan.append(prefer_file)
+        for rel in self._grep_table_initializer_files(
+            project_root, table_name, exclude, max_files
+        ):
+            if rel not in to_scan:
+                to_scan.append(rel)
+
+        merged: list[str] = []
+        for rel in to_scan:
+            full = project_root / rel
+            try:
+                source = full.read_bytes()
+            except OSError:
+                continue
+            for fn in self.find_table_field_targets(
+                source, rel, table_name, field_name
+            ):
+                if fn not in merged:
+                    merged.append(fn)
+        return merged
+
+    def _grep_table_initializer_files(
+        self,
+        project_root: Path,
+        table_name: str,
+        exclude_dirs: list[str],
+        max_files: int,
+    ) -> list[str]:
+        """grep 含 ``table_name[] =`` 的源文件（表初始化通常在定义处）。"""
+        # 不用 \\b：行首常有 ``} cmd_table[] =``，\\b 在部分 grep 下匹配失败
+        pat = rf"{re.escape(table_name)}\s*\[.*\]\s*="
+        exclude_args: list[str] = []
+        for d in exclude_dirs:
+            exclude_args += ["--exclude-dir", d]
+        cmd = [
+            "grep", "-rIlE", pat,
+            "--include=*.c", "--include=*.h",
+            "--include=*.cc", "--include=*.cpp",
+            *exclude_args,
+            str(project_root),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15, check=False
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
+        rels: list[str] = []
+        for line in proc.stdout.splitlines():
+            try:
+                rel = str(Path(line).relative_to(project_root))
+            except ValueError:
+                continue
+            rels.append(rel)
+            if len(rels) >= max_files:
+                break
+        return rels
+
+    def _root_identifier_from_expr(self, node: ts.Node | None, source: bytes) -> str:
+        """从 ``cmd_table[i]`` / ``p->x`` 等表达式取出根变量名。"""
+        if node is None:
+            return ""
+        if node.type == "identifier":
+            return self.node_text(source, node)
+        if node.type == "subscript_expression":
+            return self._root_identifier_from_expr(
+                node.child_by_field_name("argument"), source
+            )
+        if node.type in ("field_expression", "pointer_expression"):
+            return self._root_identifier_from_expr(
+                node.child_by_field_name("argument"), source
+            )
+        if node.type == "parenthesized_expression" and node.children:
+            return self._root_identifier_from_expr(node.children[1], source)
+        return ""
+
+    def _declarator_identifier(self, node: ts.Node, source: bytes) -> str:
+        """从 declarator 子树取变量名（含 array_declarator）。"""
+        if node.type == "identifier":
+            return self.node_text(source, node)
+        if node.type == "array_declarator":
+            inner = node.child_by_field_name("declarator")
+            return self._declarator_identifier(inner, source) if inner else ""
+        if node.type == "pointer_declarator":
+            inner = node.child_by_field_name("declarator")
+            return self._declarator_identifier(inner, source) if inner else ""
+        for ch in node.children:
+            t = self._declarator_identifier(ch, source)
+            if t:
+                return t
+        return ""
+
+    def _field_index_in_table_declaration(
+        self, root: ts.Node, source: bytes, table_name: str, field_name: str
+    ) -> int:
+        """在 table 前的匿名 struct 里定位字段下标；找不到则 -1（用行内最后一个标识符）。"""
+        for node in self.walk(root):
+            if node.type != "declaration":
+                continue
+            has_table = False
+            field_list: ts.Node | None = None
+            for ch in node.children:
+                if ch.type == "struct_specifier":
+                    body = ch.child_by_field_name("body")
+                    if body is not None:
+                        field_list = body
+                if ch.type == "init_declarator":
+                    decl = ch.child_by_field_name("declarator")
+                    if decl and self._declarator_identifier(decl, source) == table_name:
+                        has_table = True
+            if not has_table or field_list is None:
+                continue
+            idx = 0
+            for fd in field_list.children:
+                if fd.type != "field_declaration":
+                    continue
+                for sub in self.walk(fd):
+                    if sub.type == "field_identifier":
+                        if self.node_text(source, sub) == field_name:
+                            return idx
+                idx += 1
+        return -1
+
+    def _initializer_list_for_table(
+        self, root: ts.Node, source: bytes, table_name: str
+    ) -> ts.Node | None:
+        for node in self.walk(root):
+            if node.type == "declaration":
+                for ch in node.children:
+                    if ch.type != "init_declarator":
+                        continue
+                    decl = ch.child_by_field_name("declarator")
+                    if decl is None or self._declarator_identifier(decl, source) != table_name:
+                        continue
+                    init = ch.child_by_field_name("value")
+                    if init is not None and init.type == "initializer_list":
+                        return init
+        return None
+
+    def _value_at_initializer_index(
+        self, source: bytes, init_node: ts.Node, field_idx: int
+    ) -> str:
+        """取 ``{a, b, fn}`` 中第 field_idx 个元素；field_idx<0 时取行内最后一个函数名标识符。"""
+        value = init_node
+        if value.type == "initializer" and value.children:
+            if value.children[0].type == "=" and len(value.children) > 1:
+                value = value.children[1]
+        if value.type != "initializer_list":
+            return self._expr_as_function_name(value, source)
+        # 表项常为 { "name", "desc", cmd_fn }，tree-sitter 标成 initializer_list
+        elems = [
+            c for c in value.children
+            if c.type not in (",", "{", "}", "(", ")", "comment")
+        ]
+        if field_idx >= 0 and field_idx < len(elems):
+            return self._expr_as_function_name(elems[field_idx], source)
+        for it in reversed(elems):
+            t = self._expr_as_function_name(it, source)
+            if t:
+                return t
+        return ""
+
+    def _expr_as_function_name(self, node: ts.Node, source: bytes) -> str:
+        if node.type == "identifier":
+            return self.node_text(source, node)
+        if node.type == "initializer":
+            return self._expr_as_function_name(
+                node.children[-1] if node.children else node, source
+            )
+        if node.type == "initializer_list":
+            return self._value_at_initializer_index(source, node, -1)
+        for ch in node.children:
+            t = self._expr_as_function_name(ch, source)
+            if t:
+                return t
+        return ""
 
     # --- 内部工具 ---
 

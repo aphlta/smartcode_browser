@@ -321,6 +321,9 @@ html, body {
 }
 .ref:hover { color: var(--accent-hover); background: rgba(88,166,255,0.15); text-decoration: underline; }
 .ref.opened { background: rgba(88,166,255,0.18); }
+/* 函数指针成员调用：略偏紫，提示点击会列出表内全部 handler */
+.ref.ref-member { color: #b392f0; }
+.ref.ref-member:hover { text-decoration: underline; }
 
 /* 普通标识符（变量等）：默认中性色，悬停才提示可点，避免满屏彩色 */
 .tok { cursor: pointer; border-radius: 3px; }
@@ -343,6 +346,10 @@ html, body {
   box-shadow: 0 8px 24px rgba(0,0,0,0.5);
   max-height: 300px; overflow-y: auto;
   font-family: monospace; font-size: 12px;
+}
+.cand-menu .cand-menu-head {
+  padding: 6px 12px; color: var(--text-dim); font-size: 11px;
+  border-bottom: 1px solid var(--border); background: var(--bg-header);
 }
 .cand-menu .citem { padding: 6px 12px; cursor: pointer; border-bottom: 1px solid var(--border); }
 .cand-menu .citem:hover { background: var(--bg-header); }
