@@ -436,8 +436,13 @@ function addPanel(detail, parentId, fromRef) {
 
 function refKey(ref) { return `${ref.name}@${ref.line}:${ref.col}`; }
 
-/** 符号唯一键：同一 file+行 视为同一定义，可复用面板 */
+/** 符号唯一键：同一定义只保留一个面板（多入口跳转/查用法时复用） */
 function symbolKey(detail) {
+  const fnLike = new Set(["function", "method", "constructor", "macro"]);
+  // 函数/宏：同文件同名即同一符号（避免 ERROR 节点与正常解析 start_line 差 1～2 行导致重复面板）
+  if (detail.kind && fnLike.has(detail.kind) && detail.name) {
+    return `${detail.file}:${detail.name}`;
+  }
   return `${detail.file}:${detail.start_line}`;
 }
 
@@ -589,6 +594,22 @@ async function navFromToken(panelId, el, ev) {
   }
 }
 
+/**
+ * 从 parent 打开 detail：若树上已有同符号面板则复用并追加连线，避免多入口各开一份。
+ * 函数指针成员调用、Shift 强制新开时仍允许重复面板。
+ */
+function openPanelFrom(parentId, fromRef, detail, opts = {}) {
+  const memberFp = opts.memberFp || fromRef.refKind === "member";
+  if (!opts.forceNew && !memberFp) {
+    const existingId = findPanelBySymbol(detail);
+    if (existingId && existingId !== parentId) {
+      linkPanelFrom(parentId, fromRef, existingId, opts);
+      return existingId;
+    }
+  }
+  return addPanel(detail, parentId, fromRef);
+}
+
 async function openCandidate(panelId, ref, cand, forceNew = false) {
   // 局部变量声明：就在当前函数面板内，闪烁定位即可，不另开面板
   if (cand.kind === "local") {
@@ -599,15 +620,7 @@ async function openCandidate(panelId, ref, cand, forceNew = false) {
   try {
     const detail = await fetchSymbol(cand.file, cand.name, cand.line);
     if (!detail) { toast("目标源码不可读"); return; }
-    // 函数指针：每次选择都新开子面板；普通调用仍可复用已有面板（Shift 强制新开）
-    if (!forceNew && !memberFp) {
-      const existingId = findPanelBySymbol(detail);
-      if (existingId && existingId !== panelId) {
-        linkPanelFrom(panelId, ref, existingId);
-        return;
-      }
-    }
-    addPanel(detail, panelId, ref);
+    openPanelFrom(panelId, ref, detail, { forceNew, memberFp });
   } catch (e) { toast("展开失败: " + e.message); }
 }
 
@@ -701,7 +714,7 @@ async function openUsageRow(originPanelId, fromRef, u) {
       receiver: fromRef.receiver || "",
       refKind: fromRef.refKind || "usage",
     };
-    const id = addPanel(detail, originPanelId, usageRef);
+    const id = openPanelFrom(originPanelId, usageRef, detail);
     setTimeout(() => flashLine(id, u.line), 120);
   } catch (e) { toast("打开失败: " + e.message); }
 }
