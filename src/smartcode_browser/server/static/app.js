@@ -617,7 +617,7 @@ async function openUsages(panelId, fromRef, anchorEl) {
   try {
     list = await api("/api/usages", { project: state.project, name: fromRef.name, limit: 300 });
   } catch (e) { toast("查找用法失败: " + e.message); return; }
-  showUsagesPop(panelId, fromRef.name, list, anchorEl);
+  showUsagesPop(panelId, fromRef, list, anchorEl);
 }
 
 function closeUsagesPop() {
@@ -625,7 +625,7 @@ function closeUsagesPop() {
   if (m) m.remove();
 }
 
-function showUsagesPop(originPanelId, name, list, anchorEl) {
+function showUsagesPop(originPanelId, fromRef, list, anchorEl) {
   closeUsagesPop();
   closeCandidateMenu();
   const pop = document.createElement("div");
@@ -634,7 +634,7 @@ function showUsagesPop(originPanelId, name, list, anchorEl) {
 
   const head = document.createElement("div");
   head.className = "usages-pop-head";
-  head.innerHTML = `<span>⤢ 用法: ${escapeHtml(name)}</span>` +
+  head.innerHTML = `<span>⤢ 用法: ${escapeHtml(fromRef.name)}</span>` +
     `<span class="cnt">${list.length}</span><span class="x">×</span>`;
   head.querySelector(".x").onclick = closeUsagesPop;
   pop.appendChild(head);
@@ -649,7 +649,7 @@ function showUsagesPop(originPanelId, name, list, anchorEl) {
       `<div class="u-loc">${escapeHtml(u.file)}:${u.line}` +
       (u.enclosing ? ` <span class="u-in">in ${escapeHtml(u.enclosing)}</span>` : "") +
       `</div><div class="u-snip">${escapeHtml(u.text)}</div>`;
-    row.onclick = (e) => { e.stopPropagation(); openUsageRow(originPanelId, u); };
+    row.onclick = (e) => { e.stopPropagation(); openUsageRow(originPanelId, fromRef, u); };
     body.appendChild(row);
   });
   pop.appendChild(body);
@@ -685,17 +685,23 @@ function onEscCloseUsages(e) {
   }
 }
 
-// 点击用法行 → 在「变量所在面板」下打开其所属函数并闪烁，然后关闭弹窗
-async function openUsageRow(originPanelId, u) {
+// 点击用法行 → 打开所属函数/宏（或行上下文）并闪烁用法行
+// fromRef 必须是「查找用法」时点击的标识符（父面板内 line/col），连线才从该 token 出发
+async function openUsageRow(originPanelId, fromRef, u) {
   closeUsagesPop();
-  if (!u.enclosing) {
-    toast(`顶层使用：${u.file}:${u.line}`);
-    return;
-  }
   try {
-    const detail = await fetchSymbol(u.file, u.enclosing, u.enclosing_line);
-    if (!detail) { toast("目标源码不可读"); return; }
-    const id = addPanel(detail, originPanelId, { name: u.enclosing, line: u.line, col: 1 });
+    const detail = await api("/api/open_at", {
+      project: state.project, file: u.file, line: u.line,
+    });
+    if (!detail) { toast("无法打开该用法位置"); return; }
+    const usageRef = {
+      name: fromRef.name,
+      line: fromRef.line,
+      col: fromRef.col,
+      receiver: fromRef.receiver || "",
+      refKind: fromRef.refKind || "usage",
+    };
+    const id = addPanel(detail, originPanelId, usageRef);
     setTimeout(() => flashLine(id, u.line), 120);
   } catch (e) { toast("打开失败: " + e.message); }
 }
@@ -1194,10 +1200,52 @@ function renderLine(text, callColMap, lineNo) {
   return html;
 }
 
-// 统一装饰：高亮每个「催生了子面板」的来源行，并绘制父→子箭头连线。
+/** 在父面板 DOM 中定位来源 token（优先 line+col，退回同行同名） */
+function findTokenInPanel(panelEl, fromRef) {
+  if (!panelEl || !fromRef) return null;
+  const { line, col, name } = fromRef;
+  let el = panelEl.querySelector(
+    `.tok[data-line="${line}"][data-col="${col}"], .ref[data-line="${line}"][data-col="${col}"]`
+  );
+  if (el) return el;
+  if (!name) return null;
+  for (const c of panelEl.querySelectorAll(`.tok[data-line="${line}"], .ref[data-line="${line}"]`)) {
+    if (c.dataset.name === name) return c;
+  }
+  return null;
+}
+
+/** 连线起点：Y 对齐来源标识符，X 固定在父面板右缘（不伸入面板内部） */
+function linkAnchorFromParent(parentEl, parentDetail, fromRef) {
+  const pRect = parentEl.getBoundingClientRect();
+  const token = findTokenInPanel(parentEl, fromRef);
+  if (token) {
+    const tr = token.getBoundingClientRect();
+    return {
+      x: pRect.right,
+      y: Math.min(Math.max(tr.top + tr.height / 2, pRect.top + 8), pRect.bottom - 8),
+      token,
+    };
+  }
+  const idx = parentDetail ? fromRef.line - parentDetail.start_line : -1;
+  const lineEls = parentEl.querySelectorAll(".code-line");
+  if (idx >= 0 && idx < lineEls.length) {
+    const lr = lineEls[idx].getBoundingClientRect();
+    return {
+      x: pRect.right,
+      y: Math.min(Math.max(lr.top + lr.height / 2, pRect.top + 8), pRect.bottom - 8),
+      token: null,
+    };
+  }
+  return { x: pRect.right, y: pRect.top + 40, token: null };
+}
+
+// 统一装饰：高亮每个「催生了子面板」的来源标识符，并绘制父→子箭头连线。
 // 集中处理可正确支持「同一父面板的多个分支」（多条高亮 + 多条连线）。
 function decorate() {
   document.querySelectorAll(".code-line.src-highlight").forEach((n) =>
+    n.classList.remove("src-highlight"));
+  document.querySelectorAll(".tok.src-highlight, .ref.src-highlight").forEach((n) =>
     n.classList.remove("src-highlight"));
 
   for (const id of state.order) {
@@ -1209,9 +1257,14 @@ function decorate() {
       if (!parentEl) continue;
       const parent = state.panels.get(link.parentId);
       if (!parent?.detail) continue;
-      const idx = link.fromRef.line - parent.detail.start_line;
-      const lineEls = parentEl.querySelectorAll(".code-line");
-      if (idx >= 0 && idx < lineEls.length) lineEls[idx].classList.add("src-highlight");
+      const anchor = linkAnchorFromParent(parentEl, parent.detail, link.fromRef);
+      if (anchor.token) {
+        anchor.token.classList.add("src-highlight");
+      } else {
+        const idx = link.fromRef.line - parent.detail.start_line;
+        const lineEls = parentEl.querySelectorAll(".code-line");
+        if (idx >= 0 && idx < lineEls.length) lineEls[idx].classList.add("src-highlight");
+      }
     }
   }
   drawConnectors();
@@ -1250,17 +1303,10 @@ function drawConnectors() {
     for (const link of panelLinks(panel)) {
       const parentEl = document.querySelector(`.panel[data-id="${link.parentId}"]`);
       if (!parentEl) continue;
-      const pRect = parentEl.getBoundingClientRect();
       const parent = state.panels.get(link.parentId);
-      const idx = parent?.detail ? link.fromRef.line - parent.detail.start_line : -1;
-      const lineEls = parentEl.querySelectorAll(".code-line");
-
-      let y1 = pRect.top + 40;
-      if (idx >= 0 && idx < lineEls.length) {
-        const lr = lineEls[idx].getBoundingClientRect();
-        y1 = Math.min(Math.max(lr.top + lr.height / 2, pRect.top + 30), pRect.bottom - 8);
-      }
-      const x1 = pRect.right;
+      const anchor = linkAnchorFromParent(parentEl, parent?.detail, link.fromRef);
+      const x1 = anchor.x;
+      const y1 = anchor.y;
       const x2 = cRect.left;
       const mx = (x1 + x2) / 2;
       const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;

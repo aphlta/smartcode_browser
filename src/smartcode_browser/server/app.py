@@ -82,6 +82,21 @@ def create_app(engine: CodeEngine | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="未找到符号或源码不可读")
         return JSONResponse(detail.to_dict())
 
+    @app.get("/api/open_at")
+    def open_at(
+        project: str = Query(...),
+        file: str = Query(...),
+        line: int = Query(..., ge=1),
+    ) -> JSONResponse:
+        """打开用法所在位置（函数 / 宏 / 行上下文）。"""
+        try:
+            detail = engine.open_at(project, file, line)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if detail is None:
+            raise HTTPException(status_code=404, detail="无法打开该位置")
+        return JSONResponse(detail)
+
     @app.get("/api/resolve")
     def resolve(
         project: str = Query(...),

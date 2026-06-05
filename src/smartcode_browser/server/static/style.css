@@ -304,6 +304,11 @@ html, body {
 .code-line { display: flex; white-space: pre; width: max-content; min-width: 100%; }
 .code-line:hover { background: rgba(255,255,255,0.03); }
 .code-line.src-highlight { background: var(--highlight); }
+.tok.src-highlight, .ref.src-highlight {
+  background: var(--highlight);
+  box-shadow: 0 0 0 1px rgba(187, 128, 9, 0.45);
+  border-radius: 3px;
+}
 .code-line .ln {
   flex: 0 0 56px;
   text-align: right;

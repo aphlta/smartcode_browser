@@ -110,6 +110,35 @@ class CodeEngine:
             references=resolved_refs,
         )
 
+    def open_at(self, project_id: str, file: str, line: int) -> dict | None:
+        """按用法行打开面板：优先所属函数/宏，否则展示该行上下文。
+
+        查找用法里常见头文件宏（如 ``log_write`` 内的 ``log_fp``），
+        原先无 enclosing 时前端无法开子面板。
+        """
+        index = self._index(project_id)
+        project = self.registry.get(project_id)
+        scope = self._enclosing_scope_cached(index, project, file, line, {})
+        if scope is not None:
+            detail = self.open_symbol(project_id, file, scope.name, scope.start_line)
+            return detail.to_dict() if detail else None
+        start = max(1, line - 10)
+        end = line + 10
+        ctx = self._read_lines(project, file, start, end)
+        if not ctx:
+            return None
+        return SymbolDetail(
+            name=f"{file.rsplit('/', 1)[-1]}:{line}",
+            kind="location",
+            file=file,
+            start_line=start,
+            end_line=end,
+            signature=f"用法 · {file}:{line}",
+            doc="",
+            lines=ctx,
+            references=[],
+        ).to_dict()
+
     # --- 解析引用 ---
 
     def resolve_call(
@@ -220,7 +249,7 @@ class CodeEngine:
         func_cache: dict[str, list] = {}
         results: list[dict] = []
         for rel, ln, text in hits:
-            enc = self._enclosing_function_cached(index, project, rel, ln, func_cache)
+            enc = self._enclosing_scope_cached(index, project, rel, ln, func_cache)
             results.append({
                 "file": rel,
                 "line": ln,
@@ -231,7 +260,25 @@ class CodeEngine:
         return results
 
     def _enclosing_function(self, index, project: Project, file: str, line: int):
-        return self._enclosing_function_cached(index, project, file, line, {})
+        return self._enclosing_scope_cached(index, project, file, line, {})
+
+    def _enclosing_scope_cached(
+        self, index, project: Project, file: str, line: int, cache: dict
+    ):
+        """返回包含该行的最小范围符号：函数优先，其次宏（``#define log_write`` 等）。"""
+        enc = self._enclosing_function_cached(index, project, file, line, cache)
+        if enc is not None:
+            return enc
+        index.build()
+        best: Symbol | None = None
+        for sym in index.symbols_in_file(file):
+            if sym.kind != "macro":
+                continue
+            if sym.start_line <= line <= sym.end_line:
+                span = sym.end_line - sym.start_line
+                if best is None or span < (best.end_line - best.start_line):
+                    best = sym
+        return best
 
     def _enclosing_function_cached(self, index, project: Project, file: str, line: int, cache: dict):
         """返回包含指定行的函数/方法符号（按需解析文件，范围最小者优先）。"""

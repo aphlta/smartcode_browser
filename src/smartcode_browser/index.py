@@ -340,6 +340,20 @@ class SymbolIndex:
             rf"|^[[:space:]]+{n}[[:space:]]*[,=]"
         )
 
+    def _grep_search_roots(self) -> list[Path]:
+        """全局 grep 的搜索根：与索引范围一致，避免扫到 include_paths 外的巨型目录。
+
+        include_paths 为空时回退到项目根（保持「全库回退」语义）。
+        """
+        root = self.project.root
+        bases = self.project.include_paths or ["."]
+        dirs: list[Path] = []
+        for base in bases:
+            d = (root / base).resolve()
+            if d.is_dir():
+                dirs.append(d)
+        return dirs or [root]
+
     def _grep_definitions(self, name: str) -> list[Symbol]:
         root = self.project.root
         include_args: list[str] = []
@@ -352,7 +366,8 @@ class SymbolIndex:
 
         cmd = [
             "grep", "-rInE", self._grep_patterns(name),
-            *include_args, *exclude_args, str(root),
+            *include_args, *exclude_args,
+            *[str(p) for p in self._grep_search_roots()],
         ]
         try:
             proc = subprocess.run(
@@ -419,7 +434,10 @@ class SymbolIndex:
         exclude_args: list[str] = []
         for d in self.project.exclude_dirs:
             exclude_args += ["--exclude-dir", d]
-        cmd = ["grep", "-rInw", name, *include_args, *exclude_args, str(root)]
+        cmd = [
+            "grep", "-rInw", name, *include_args, *exclude_args,
+            *[str(p) for p in self._grep_search_roots()],
+        ]
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=25, check=False
