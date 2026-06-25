@@ -13,8 +13,18 @@ import os
 import uvicorn
 
 
+def _default_host() -> str:
+    """WSL 下 Windows 浏览器访问 localhost 需监听 0.0.0.0，否则 ERR_CONNECTION_REFUSED。"""
+    env = os.environ.get("SMARTCODE_BROWSER_HOST")
+    if env:
+        return env
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
 def main() -> None:
-    host = os.environ.get("SMARTCODE_BROWSER_HOST", "127.0.0.1")
+    host = _default_host()
     port = int(os.environ.get("SMARTCODE_BROWSER_PORT", "8765"))
     # 用导入字符串而非 app 对象，避免 reload 模式下的重复构建
     uvicorn.run(

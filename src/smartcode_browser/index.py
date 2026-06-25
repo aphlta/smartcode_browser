@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 
 from .adapters import LanguageAdapter, get_adapter
+from .compile_db import CompileDB, load as load_compile_db
 from .index_cache import file_stamp, save as save_index_cache, try_load as try_load_index_cache
 from .models import Symbol
 from .registry import Project
@@ -48,6 +49,10 @@ class SymbolIndex:
         # 全局回退解析的结果缓存（含负缓存：值为空列表表示确实没找到）
         self._global_cache: dict[str, list[Symbol]] = {}
         self._global_lock = threading.Lock()
+        # 编译数据库（惰性加载；未配置时为 None）
+        self._compiledb: CompileDB | None = None
+        self._compiledb_loaded = False
+        self._compiledb_lock = threading.Lock()
 
     # --- 适配器选择 ---
 
@@ -73,6 +78,22 @@ class SymbolIndex:
             if ad.handles(rel_path):
                 return ad
         return None
+
+    # --- 编译数据库（可选，用于按实际编译消歧定义） ---
+
+    @property
+    def compiledb(self) -> CompileDB | None:
+        """惰性加载 compile_commands.json；未配置或缺失时返回 None。"""
+        if not self._compiledb_loaded:
+            with self._compiledb_lock:
+                if not self._compiledb_loaded:
+                    self._compiledb = load_compile_db(
+                        self.project.root,
+                        self.project_id,
+                        getattr(self.project, "compile_commands", ""),
+                    )
+                    self._compiledb_loaded = True
+        return self._compiledb
 
     # --- 构建 ---
 
@@ -338,12 +359,14 @@ class SymbolIndex:
             rf"|^[[:space:]]+[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]]+{n}[[:space:]]*[;=]"
             # 枚举常量：  NAME,  或  NAME =
             rf"|^[[:space:]]+{n}[[:space:]]*[,=]"
+            # 内核汇编入口：SYM_CODE_START(name) / SYM_FUNC_START(name) 等
+            rf"|^[[:space:]]*SYM_(?:CODE|FUNC|TYPED_FUNC)(?:_START(?:_(?:LOCAL|WEAK|NOALIGN|LOCAL_NOALIGN))?|_START_WEAK(?:_NOALIGN)?)[[:space:]]*\([[:space:]]*{n}[[:space:]]*\)"
         )
 
-    def _grep_search_roots(self) -> list[Path]:
+    def _grep_search_roots(self, path_filter: str | None = None) -> list[Path]:
         """全局 grep 的搜索根：与索引范围一致，避免扫到 include_paths 外的巨型目录。
 
-        include_paths 为空时回退到项目根（保持「全库回退」语义）。
+        include_paths 为空时回退到项目根。path_filter 为相对路径时可收窄到子目录。
         """
         root = self.project.root
         bases = self.project.include_paths or ["."]
@@ -352,7 +375,30 @@ class SymbolIndex:
             d = (root / base).resolve()
             if d.is_dir():
                 dirs.append(d)
-        return dirs or [root]
+        if not dirs:
+            dirs = [root]
+        if not path_filter:
+            return dirs
+        pf = path_filter.replace("\\", "/").strip().strip("/")
+        if not pf:
+            return dirs
+        direct = (root / pf).resolve()
+        try:
+            direct.relative_to(root)
+            if direct.is_dir():
+                return [direct]
+        except ValueError:
+            pass
+        pl = pf.lower()
+        narrowed: list[Path] = []
+        for d in dirs:
+            try:
+                rel = d.relative_to(root).as_posix().lower()
+            except ValueError:
+                rel = ""
+            if rel == pl or rel.startswith(pl + "/") or pl.startswith(rel + "/"):
+                narrowed.append(d)
+        return narrowed or dirs
 
     def _grep_definitions(self, name: str) -> list[Symbol]:
         root = self.project.root
@@ -419,10 +465,12 @@ class SymbolIndex:
                 results.append(sym)
         return results
 
-    def grep_word(self, name: str, limit: int = 200) -> list[tuple[str, int, str]]:
+    def grep_word(
+        self, name: str, limit: int = 200, path_filter: str | None = None
+    ) -> list[tuple[str, int, str]]:
         """全词搜索 name 的所有出现（用于「查找用法」），返回 (相对路径, 行号, 行文本)。
 
-        命中可能很多（如常见变量名），故按 limit 截断；调用方再按所属函数聚合。
+        path_filter 限定相对路径（子串或 ``dir/`` 前缀）；命中可能很多，按 limit 截断。
         """
         if not _IDENT_RE.match(name):
             return []
@@ -436,7 +484,7 @@ class SymbolIndex:
             exclude_args += ["--exclude-dir", d]
         cmd = [
             "grep", "-rInw", name, *include_args, *exclude_args,
-            *[str(p) for p in self._grep_search_roots()],
+            *[str(p) for p in self._grep_search_roots(path_filter)],
         ]
         try:
             proc = subprocess.run(
@@ -455,6 +503,8 @@ class SymbolIndex:
                 ln = int(parts[1])
             except ValueError:
                 continue
+            if path_filter and not self._file_matches_path(rel, path_filter):
+                continue
             out.append((rel, ln, parts[2]))
             if len(out) >= limit:
                 break
@@ -465,6 +515,7 @@ class SymbolIndex:
     @property
     def stats(self) -> dict:
         self.build()
+        db = self.compiledb
         return {
             "files_indexed": self._file_count,
             "symbols": sum(len(v) for v in self._by_name.values()),
@@ -472,4 +523,6 @@ class SymbolIndex:
             "truncated": self._truncated,
             "from_cache": self._from_disk_cache,
             "adapters": [a.name for a in self._adapters],
+            # 编译数据库：None=未配置/缺失；否则给出已编译 TU 数量
+            "compile_db": (len(db.compiled_files) if db else 0),
         }

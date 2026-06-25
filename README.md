@@ -9,6 +9,7 @@
 | 调用 → 定义 | 点击蓝色 `.ref`，级联打开被调函数（多实现时真实现优先） |
 | 变量 → 声明 | 点击标识符，局部变量在本面板闪烁，全局/字段/枚举打开声明 |
 | 查找用法 | Alt/Ctrl+点击 或 右键，弹出用法列表 |
+| 多 arch 消歧 | 配置编译数据库后，同名定义优先跳到**实际编译**的那一份（见下） |
 | 会话恢复 | 刷新后自动恢复上次代码树 |
 | 命名标签 | 顶栏「保存到标签」，一键恢复探索路径 |
 
@@ -74,6 +75,53 @@ projects:
 
 被浏览的代码库需**单独 clone** 到服务器；本仓库只包含浏览器工具本身。
 
+## 编译数据库（可选，提升跳转准确度）
+
+纯静态解析只能按**名字**找定义，遇到内核 / NEMU 这类**多 arch / 多 ISA 同名**
+（如 `isa_reg_display` 在 x86 / riscv32 / mips32 / loongarch32r 各有一份）或
+`#ifdef` 条件编译时只能靠启发式猜。配置编译器生成的 `compile_commands.json` 后，
+工具会识别「本次实际编译了哪些翻译单元」，让跳转**稳定命中真正被编译的那一份**。
+
+特性：
+
+- **纯增量、可缺省**：不配置时行为完全不变；只在「同名候选里确实有一份被编译过」
+  时才消歧，故编译库即使只覆盖部分子工程也不会误伤其它目录的唯一定义。
+- 同时利用每个 TU 的 `-I` 搜索路径，让头文件里的宏/inline 优先选当前 TU 可达的那个头。
+- 按 `compile_commands.json` 的 mtime/size 做磁盘缓存，数万条目也不会拖慢启动。
+
+在项目里加一行 `compile_commands`（相对 `root` 或绝对路径）即可启用：
+
+```yaml
+  - id: ysyx-workbench
+    root: /home/alex/ysyx-workbench
+    language: c
+    extra_languages: [asm]
+    compile_commands: nemu/compile_commands.json   # 可选
+```
+
+生成 `compile_commands.json`（任选其一）：
+
+```bash
+# 通用：pip 安装，无需 root
+pip install compiledb
+cd <子工程> && make clean && compiledb make
+
+# 通用：bear（需 apt/brew 安装）
+cd <子工程> && make clean && bear -- make
+
+# Linux 内核自带目标（生成在仓库根）
+make ARCH=arm64 <你的配置> && make compile_commands.json
+
+# U-Boot
+make <board>_defconfig && make && make compile_commands.json
+```
+
+启用后重启服务即可（符号索引缓存无需清；编译库是查询期叠加的）。可用
+`curl "http://127.0.0.1:8765/api/stats?project=<id>"` 查看 `compile_db` 字段确认已编译 TU 数。
+
+> 注：编译数据库随**配置**变化。如 NEMU 切换 ISA（`make menuconfig`）后需重新生成，
+> 跳转才会指向新 ISA 的实现。
+
 ## 服务器部署
 
 ```bash
@@ -108,6 +156,7 @@ smartcode_browser/
   adapters/           tree-sitter 语言适配器（可插拔）
   registry.py         多项目注册表
   index.py            符号索引 + grep 全局回退
+  compile_db.py       编译数据库（compile_commands.json）解析，按实际编译消歧
   engine.py           引擎
   server/             FastAPI + 原生前端
 projects/

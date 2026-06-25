@@ -186,7 +186,7 @@ class CodeEngine:
                     continue
                 seen.add(key)
                 symbols.append(s)
-        ranked = self._rank_definitions(symbols, file)
+        ranked = self._rank_definitions(symbols, file, index)
         return [d.to_dict() for d in ranked]
 
     def resolve(self, project_id: str, name: str, from_file: str = "") -> list[dict]:
@@ -197,7 +197,7 @@ class CodeEngine:
         """
         index = self._index(project_id)
         merged = self._merged_candidates(index, name)
-        ranked = self._rank_definitions(merged, from_file)
+        ranked = self._rank_definitions(merged, from_file, index)
         return [d.to_dict() for d in ranked]
 
     # --- 变量/标识符解析（局部优先 + 全局） ---
@@ -228,22 +228,28 @@ class CodeEngine:
 
         # 2) 全局候选（去重时排除已加入的局部）
         merged = self._merged_candidates(index, name)
-        ranked = self._rank_definitions(merged, file)
+        ranked = self._rank_definitions(merged, file, index)
         seen = {(c.file, c.line) for c in candidates}
         for d in ranked:
             if (d.file, d.line) not in seen:
                 candidates.append(d)
         return [c.to_dict() for c in candidates]
 
-    def find_usages(self, project_id: str, name: str, limit: int = 200) -> list[dict]:
+    def find_usages(
+        self,
+        project_id: str,
+        name: str,
+        limit: int = 200,
+        path: str | None = None,
+    ) -> list[dict]:
         """查找标识符 name 的所有使用位置，按「所属函数」聚合返回。
 
+        path：可选，相对路径过滤（如 ``fs/``、``drivers/mmc``）。
         返回每条：{file, line, text, enclosing(所属函数名或''), enclosing_line}
-        供前端列成「用法」面板，点击跳到对应位置。
         """
         index = self._index(project_id)
         project = self.registry.get(project_id)
-        hits = index.grep_word(name, limit=limit)
+        hits = index.grep_word(name, limit=limit, path_filter=path)
 
         # 缓存每个文件的函数符号，避免重复解析
         func_cache: dict[str, list] = {}
@@ -352,20 +358,51 @@ class CodeEngine:
         return out
 
     def _rank_definitions(
-        self, syms: list[Symbol], from_file: str
+        self,
+        syms: list[Symbol],
+        from_file: str,
+        index: SymbolIndex | None = None,
     ) -> list[Definition]:
         """对候选排序：真实现优先，空桩/头文件 inline 靠后。
 
         排序键（小者靠前）：
         - empty：空实现排最后
+        - arch_penalty：配了编译数据库时，**未被编译**的同类源文件（多 arch 同名
+          的另一份）沉底，确保跳到「本次实际编译的那一份」
+        - reachable：头文件定义中，落在当前 TU 头文件搜索路径（-I）内的优先
         - 非 .c 文件（头文件里的 inline 多为桩）排后
         - 同文件定义略微优先（静态局部函数常见）
         """
+        db = index.compiledb if index is not None else None
+        inc_dirs = db.include_dirs_for(from_file) if db else ()
+
+        # 只在「本组候选里确实有一个被编译过」时才消歧：避免编译库只覆盖部分子工程
+        # （如 ysyx 只生成了 nemu 的 compile_commands.json）时，误伤其它子工程里
+        # 唯一存在的同名定义。
+        has_compiled = bool(db) and any(
+            db.covers_ext(s.file) and db.is_compiled(s.file) for s in syms
+        )
+
+        def arch_penalty(s: Symbol) -> int:
+            if not has_compiled or not db.covers_ext(s.file):
+                return 0
+            return 0 if db.is_compiled(s.file) else 1
+
+        def reachable(s: Symbol) -> int:
+            if not inc_dirs:
+                return 0
+            f = s.file.replace("\\", "/")
+            d = f.rsplit("/", 1)[0] if "/" in f else ""
+            for inc in inc_dirs:
+                if d == inc or f.startswith(inc + "/"):
+                    return 0
+            return 1
+
         def sort_key(s: Symbol):
             empty = 1 if s.empty else 0
             is_header = 0 if s.file.endswith((".c", ".cc", ".cpp", ".cxx")) else 1
             same = 0 if s.file == from_file else 1
-            return (empty, is_header, same, s.file, s.start_line)
+            return (empty, arch_penalty(s), reachable(s), is_header, same, s.file, s.start_line)
 
         return [
             Definition(

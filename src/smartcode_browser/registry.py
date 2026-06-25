@@ -31,6 +31,9 @@ class Project:
     include_paths: list[str] = field(default_factory=list)
     extra_languages: list[str] = field(default_factory=list)
     exclude_dirs: list[str] = field(default_factory=list)
+    # 可选：编译数据库（compile_commands.json）相对/绝对路径。
+    # 配置后用于「按实际编译的翻译单元」优先解析定义、消歧多 arch 同名。
+    compile_commands: str = ""
 
     def exists(self) -> bool:
         return self.root.is_dir()
@@ -43,6 +46,7 @@ class Project:
             "language": self.language,
             "include_paths": self.include_paths,
             "extra_languages": self.extra_languages,
+            "compile_commands": self.compile_commands,
             "exists": self.exists(),
         }
 
@@ -114,6 +118,7 @@ def load_projects() -> list[Project]:
                 include_paths=raw.get("include_paths", []),
                 extra_languages=raw.get("extra_languages", []),
                 exclude_dirs=raw.get("exclude_dirs", list(_DEFAULT_EXCLUDES)),
+                compile_commands=raw.get("compile_commands", ""),
             )
         )
     return projects or _builtin_projects()

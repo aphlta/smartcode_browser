@@ -36,6 +36,10 @@ def get_adapter(language: str) -> LanguageAdapter:
         from .java_adapter import JavaAdapter
 
         adapter = JavaAdapter()
+    elif language in ("asm", "assembly", "s"):
+        from .asm_adapter import AsmAdapter
+
+        adapter = AsmAdapter()
     else:
         raise KeyError(f"暂不支持的语言适配器: {language}")
 
@@ -45,7 +49,7 @@ def get_adapter(language: str) -> LanguageAdapter:
 
 def available_languages() -> list[str]:
     """返回当前可用的语言名（用于前端/诊断）。"""
-    return ["c", "python", "java", "scala"]
+    return ["c", "python", "java", "scala", "asm"]
 
 
 __all__ = ["LanguageAdapter", "get_adapter", "available_languages"]

@@ -14,7 +14,11 @@ const state = {
   _restoring: false, // 恢复会话时跳过自动保存，避免写入半成品
   aiConfigured: false,
   aiModel: "",
-  ai: null, // { panelId, threadId, selectedText }
+  aiBackend: "",
+  searchMode: "def", // def=定义 | use=调用位置
+  focusedPanelId: null,
+  autoBookmarkId: null,   // 当前树对应的自动同步标签 id
+  autoBookmarkName: null, // 用户自定义标签名（再次保存时沿用）
 };
 
 // localStorage 键：上次会话 + 用户命名的标签书签 + AI 分析记录
@@ -26,6 +30,7 @@ const el = {
   projectSelect: document.getElementById("project-select"),
   searchInput: document.getElementById("search-input"),
   searchResults: document.getElementById("search-results"),
+  searchMode: document.getElementById("search-mode"),
   board: document.getElementById("board"),
   stats: document.getElementById("stats"),
   emptyHint: document.getElementById("empty-hint"),
@@ -36,16 +41,9 @@ const el = {
   bookmarkSaveOk: document.getElementById("bookmark-save-ok"),
   bookmarkSaveCancel: document.getElementById("bookmark-save-cancel"),
   codeCtxMenu: document.getElementById("code-ctx-menu"),
-  aiDrawer: document.getElementById("ai-drawer"),
-  aiDrawerTitle: document.getElementById("ai-drawer-title"),
-  aiDrawerSub: document.getElementById("ai-drawer-sub"),
-  aiDrawerClose: document.getElementById("ai-drawer-close"),
-  aiThreadList: document.getElementById("ai-thread-list"),
-  aiNewThread: document.getElementById("ai-new-thread"),
-  aiMessages: document.getElementById("ai-messages"),
-  aiInput: document.getElementById("ai-input"),
-  aiSend: document.getElementById("ai-send"),
-  aiStatus: document.getElementById("ai-status"),
+  funcMap: document.getElementById("func-map"),
+  funcMapBody: document.getElementById("func-map-body"),
+  funcMapToggle: document.getElementById("func-map-toggle"),
 };
 
 // ---------- 工具 ----------
@@ -125,10 +123,67 @@ function schedulePersist() {
   if (state._restoring) return;
   clearTimeout(_persistTimer);
   _persistTimer = setTimeout(() => {
-    const snap = serializeState();
-    if (snap) localStorage.setItem(LS_SESSION, JSON.stringify(snap));
-    else localStorage.removeItem(LS_SESSION);
+    persistTreeNow(false);
   }, 350);
+}
+
+/** 立即写入会话 + 自动标签（关闭/清树前需 force=true） */
+function persistTreeNow(force) {
+  const snap = serializeState();
+  if (snap) {
+    localStorage.setItem(LS_SESSION, JSON.stringify(snap));
+    syncAutoBookmark(snap);
+  } else {
+    localStorage.removeItem(LS_SESSION);
+  }
+  if (force) clearTimeout(_persistTimer);
+}
+
+function treeFingerprint(snap) {
+  if (!snap?.panels?.length) return "";
+  const root = snap.panels.find((p) => p.parentIndex < 0) || snap.panels[0];
+  return `${snap.project}:${root.file}:${root.name}:${root.line}`;
+}
+
+function autoBookmarkDefaultName(snap) {
+  const root = snap?.panels?.find((p) => p.parentIndex < 0) || snap?.panels?.[0];
+  if (!root) return "代码树";
+  const base = (root.file || "").split("/").pop() || root.file;
+  const stem = base.replace(/\.(c|S|s|cpp|h)$/i, "");
+  return `${root.name} · ${stem}`;
+}
+
+function findAutoBookmarkId(project, fingerprint) {
+  const bookmarks = loadBookmarksStore();
+  for (const [id, bm] of Object.entries(bookmarks)) {
+    if (bm.auto && bm.fingerprint === fingerprint && bm.session?.project === project) {
+      return id;
+    }
+  }
+  return null;
+}
+
+function syncAutoBookmark(snap) {
+  if (!snap?.panels?.length) return;
+  const fp = treeFingerprint(snap);
+  const bookmarks = loadBookmarksStore();
+  let id = state.autoBookmarkId || findAutoBookmarkId(snap.project, fp);
+  if (!id) id = "bm-auto-" + Date.now();
+  const name =
+    state.autoBookmarkName ||
+    bookmarks[id]?.name ||
+    autoBookmarkDefaultName(snap);
+  bookmarks[id] = {
+    name,
+    savedAt: new Date().toISOString(),
+    session: snap,
+    auto: true,
+    fingerprint: fp,
+  };
+  saveBookmarksStore(bookmarks);
+  state.autoBookmarkId = id;
+  state.autoBookmarkName = name;
+  renderBookmarkList();
 }
 
 function loadBookmarksStore() {
@@ -159,8 +214,8 @@ function renderBookmarkList() {
   el.bookmarkList.innerHTML = "";
   entries.forEach(([id, bm]) => {
     const pill = document.createElement("div");
-    pill.className = "bookmark-pill";
-    pill.title = `${bm.name}\n${bm.session?.panels?.length || 0} 个面板 · ${formatSavedAt(bm.savedAt)}`;
+    pill.className = "bookmark-pill" + (bm.auto ? " auto" : "");
+    pill.title = `${bm.name}${bm.auto ? " · 自动同步" : ""}\n${bm.session?.panels?.length || 0} 个面板 · ${formatSavedAt(bm.savedAt)}`;
     pill.innerHTML =
       `<span class="bm-name">${escapeHtml(bm.name)}</span>` +
       `<span class="bm-del" title="删除标签">×</span>`;
@@ -188,7 +243,10 @@ function openBookmarkDialog() {
     toast("当前没有可保存的代码树，请先搜索并打开一个函数");
     return;
   }
-  el.bookmarkNameInput.value = defaultBookmarkName();
+  el.bookmarkNameInput.value =
+    state.autoBookmarkName ||
+    loadBookmarksStore()[state.autoBookmarkId]?.name ||
+    defaultBookmarkName();
   el.bookmarkDialog.classList.remove("hidden");
   el.bookmarkNameInput.focus();
   el.bookmarkNameInput.select();
@@ -211,12 +269,20 @@ function saveCurrentAsBookmark() {
     return;
   }
   const bookmarks = loadBookmarksStore();
-  const id = "bm-" + Date.now();
-  bookmarks[id] = { name, savedAt: new Date().toISOString(), session: snap };
+  const id = state.autoBookmarkId || ("bm-" + Date.now());
+  bookmarks[id] = {
+    name,
+    savedAt: new Date().toISOString(),
+    session: snap,
+    auto: !!state.autoBookmarkId,
+    fingerprint: treeFingerprint(snap),
+  };
   saveBookmarksStore(bookmarks);
+  state.autoBookmarkId = id;
+  state.autoBookmarkName = name;
   renderBookmarkList();
   closeBookmarkDialog();
-  toast(`已保存标签「${name}」`);
+  toast(state.autoBookmarkId && bookmarks[id]?.auto ? `已更新标签「${name}」` : `已保存标签「${name}」`);
 }
 
 function deleteBookmark(id) {
@@ -232,7 +298,13 @@ async function loadBookmark(id) {
   const bm = loadBookmarksStore()[id];
   if (!bm?.session) return;
   const ok = await restoreSession(bm.session);
-  if (ok) toast(`已打开标签「${bm.name}」`);
+  if (ok) {
+    state.autoBookmarkId = bm.auto ? id : null;
+    state.autoBookmarkName = bm.name || null;
+    toast(`已打开标签「${bm.name}」`);
+  } else if (bm.session?.panels?.length) {
+    toast("标签恢复失败：部分符号可能已移动，请尝试重新搜索打开");
+  }
 }
 
 async function restoreSession(snap) {
@@ -246,28 +318,66 @@ async function restoreSession(snap) {
     }
     el.projectSelect.value = snap.project;
     state.project = snap.project;
-    clearAllPanels({ silent: true });
+    clearAllPanels({ silent: true, skipSave: true });
     await refreshProjectStats(snap.project);
 
+    state.seq = Math.max(state.seq, snap.seq || 0);
     const builtIds = [];
+    let failCount = 0;
+
     for (const ps of snap.panels) {
-      const detail = await fetchSymbol(ps.file, ps.name, ps.line);
-      const id = "p" + state.seq++;
-      const parentId = ps.parentIndex >= 0 ? builtIds[ps.parentIndex] : null;
-      insertPanel(detail, parentId, ps.fromRef, id);
+      let detail = null;
+      try {
+        detail = await fetchSymbol(ps.file, ps.name, ps.line);
+      } catch {
+        try {
+          detail = await api("/api/open_at", {
+            project: snap.project,
+            file: ps.file,
+            line: ps.line,
+          });
+        } catch {
+          detail = null;
+        }
+      }
+      if (!detail?.lines?.length && detail?.file) {
+        failCount++;
+        continue;
+      }
+      if (!detail) {
+        failCount++;
+        continue;
+      }
+
+      const parentId =
+        ps.parentIndex >= 0 && ps.parentIndex < builtIds.length
+          ? builtIds[ps.parentIndex]
+          : null;
+      const id = insertPanel(detail, parentId, ps.fromRef || null, "p" + state.seq++);
       if (ps.manualPos) state.panels.get(id).manualPos = ps.manualPos;
       builtIds.push(id);
     }
-    // 恢复「复用面板」的额外来源连线
+
+    if (!builtIds.length) {
+      toast(`标签恢复失败：${failCount} 个面板无法加载（符号或行号可能已变化）`);
+      return false;
+    }
+    if (failCount) {
+      toast(`已恢复 ${builtIds.length} 个面板，${failCount} 个跳过`);
+    }
+
     snap.panels.forEach((ps, i) => {
       if (!ps.extraLinks?.length) return;
       const targetId = builtIds[i];
+      if (!targetId) return;
       for (const xl of ps.extraLinks) {
         const parentId = builtIds[xl.parentIndex];
         if (parentId) linkPanelFrom(parentId, xl.fromRef, targetId, { silent: true });
       }
     });
+
     render();
+    if (builtIds.length) focusPanel(builtIds[builtIds.length - 1]);
     requestAnimationFrame(() => {
       if (snap.boardScroll) {
         el.board.scrollLeft = snap.boardScroll.left || 0;
@@ -279,7 +389,7 @@ async function restoreSession(snap) {
     return true;
   } catch (e) {
     toast("恢复失败: " + e.message);
-    clearAllPanels({ silent: true });
+    clearAllPanels({ silent: true, skipSave: true });
     return false;
   } finally {
     state._restoring = false;
@@ -344,12 +454,57 @@ async function refreshProjectStats(id) {
 }
 
 async function setProject(id) {
+  await flushTreeBeforeClear();
   state.project = id;
-  clearAllPanels();
+  clearAllPanels({ silent: true, skipSave: true });
   await refreshProjectStats(id);
 }
 
 // ---------- 搜索 ----------
+
+/** 与后端 index.parse_search_query 一致：in:/@ 路径过滤 + 符号名 */
+function parseSearchQuery(query) {
+  const q = query.trim();
+  if (!q) return { pathFilter: null, nameQ: "" };
+  const low = q.toLowerCase();
+  if (low.startsWith("in:") || q.startsWith("@")) {
+    const prefixLen = low.startsWith("in:") ? 3 : 1;
+    const rest = q.slice(prefixLen).trimStart();
+    if (!rest) return { pathFilter: null, nameQ: "" };
+    if (rest.includes(" ")) {
+      const sp = rest.indexOf(" ");
+      return { pathFilter: rest.slice(0, sp).trim(), nameQ: rest.slice(sp + 1).trim() };
+    }
+    return { pathFilter: rest, nameQ: "" };
+  }
+  return { pathFilter: null, nameQ: q };
+}
+
+function fileMatchesPath(rel, pathFilter) {
+  const r = rel.replace(/\\/g, "/");
+  const p = pathFilter.replace(/\\/g, "/").trim();
+  if (!p) return true;
+  const rl = r.toLowerCase();
+  const pl = p.toLowerCase();
+  if (p.endsWith("/")) {
+    const prefix = pl.replace(/\/$/, "") + "/";
+    return rl.startsWith(prefix) || rl.includes("/" + prefix);
+  }
+  return rl.includes(pl);
+}
+
+function setSearchMode(mode) {
+  state.searchMode = mode;
+  el.searchMode?.querySelectorAll(".search-mode-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.mode === mode);
+  });
+  const ph = mode === "use"
+    ? "调用：read 或 in:fs/ read（结果内可再筛目录）"
+    : "符号定义：符号名 或 in:nemu/ main";
+  el.searchInput.placeholder = ph;
+  const q = el.searchInput.value.trim();
+  if (q) runSearch(q);
+}
 
 let searchTimer = null;
 function onSearchInput() {
@@ -359,18 +514,156 @@ function onSearchInput() {
   searchTimer = setTimeout(() => runSearch(q), 200);
 }
 
+function appendSearchFoot(hasTree) {
+  if (!hasTree) return;
+  const foot = document.createElement("div");
+  foot.className = "search-foot";
+  foot.textContent = "点击：挂到当前面板保留调用树 · Shift+点击：新开根替换树";
+  el.searchResults.appendChild(foot);
+}
+
+/** 拉取用法列表；path 传给后端收窄 grep 范围（常见名如 read 必备） */
+async function fetchUsages(name, pathFilter, limit = 500) {
+  const params = { project: state.project, name, limit };
+  if (pathFilter) params.path = pathFilter;
+  return api("/api/usages", params);
+}
+
+function buildUsageRow(nameQ, u, onPick) {
+  const row = document.createElement("div");
+  row.className = "item usage-item";
+  row.innerHTML =
+    `<span class="nm">${escapeHtml(nameQ)}</span>` +
+    `<span class="tag-use">调用</span>` +
+    `<span class="loc">${escapeHtml(u.file)}:${u.line}` +
+    (u.enclosing ? ` <span class="kind">in ${escapeHtml(u.enclosing)}</span>` : "") +
+    `</span>` +
+    (u.text ? `<div class="snip">${escapeHtml(u.text)}</div>` : "");
+  row.onclick = onPick;
+  return row;
+}
+
+function buildUsagePopRow(u, onPick) {
+  const row = document.createElement("div");
+  row.className = "usage-row";
+  row.innerHTML =
+    `<div class="u-loc">${escapeHtml(u.file)}:${u.line}` +
+    (u.enclosing ? ` <span class="u-in">in ${escapeHtml(u.enclosing)}</span>` : "") +
+    `</div><div class="u-snip">${escapeHtml(u.text)}</div>`;
+  row.onclick = onPick;
+  return row;
+}
+
+/** 用法结果顶栏：目录过滤（在结果内收窄，避免 read 等常见名刷屏） */
+function mountUsagePathFilter(container, ctx) {
+  const bar = document.createElement("div");
+  bar.className = "usage-filter-bar";
+  bar.innerHTML =
+    `<span class="usage-filter-lbl">目录</span>` +
+    `<input class="usage-path-input" type="text" placeholder="如 fs/ drivers/mmc （/ 结尾仅该目录）" />` +
+    `<span class="usage-filter-cnt"></span>`;
+  const input = bar.querySelector(".usage-path-input");
+  input.value = ctx.pathFilter || "";
+  input.addEventListener("click", (e) => e.stopPropagation());
+  input.addEventListener("keydown", (e) => e.stopPropagation());
+  let timer = null;
+  input.addEventListener("input", () => {
+    ctx.pathFilter = input.value.trim();
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const cntEl = bar.querySelector(".usage-filter-cnt");
+      if (cntEl) cntEl.textContent = "…";
+      try {
+        ctx.list = await fetchUsages(ctx.name, ctx.pathFilter);
+        ctx.onUpdate();
+      } catch (e) {
+        toast("过滤失败: " + e.message);
+      }
+    }, 280);
+  });
+  container.appendChild(bar);
+  ctx.filterBar = bar;
+  return bar;
+}
+
+function updateUsageFilterCount(ctx) {
+  const cntEl = ctx.filterBar?.querySelector(".usage-filter-cnt");
+  if (!cntEl) return;
+  const total = ctx.list.length;
+  const cap = ctx.displayLimit || 40;
+  const shown = Math.min(total, cap);
+  cntEl.textContent = total > shown ? `${shown}/${total} 条` : `${total} 条`;
+}
+
+function renderUsageSearchResults(nameQ, list, initialPathFilter) {
+  el.searchResults.innerHTML = "";
+  const ctx = {
+    name: nameQ,
+    list,
+    pathFilter: initialPathFilter || "",
+    displayLimit: 40,
+    filterBar: null,
+    onUpdate: () => renderUsageSearchBody(ctx),
+  };
+
+  mountUsagePathFilter(el.searchResults, ctx);
+  const body = document.createElement("div");
+  body.className = "usage-result-list";
+  el.searchResults.appendChild(body);
+  ctx.bodyEl = body;
+
+  renderUsageSearchBody(ctx);
+  appendSearchFoot(state.order.length > 0);
+  el.searchResults.classList.remove("hidden");
+}
+
+function renderUsageSearchBody(ctx) {
+  const body = ctx.bodyEl;
+  if (!body) return;
+  body.innerHTML = "";
+  updateUsageFilterCount(ctx);
+  if (!ctx.list.length) {
+    body.innerHTML = `<div class="item">${ctx.pathFilter ? "该目录下无调用" : `未找到 ${escapeHtml(ctx.name)} 的调用`}</div>`;
+    return;
+  }
+  ctx.list.slice(0, ctx.displayLimit).forEach((u) => {
+    body.appendChild(buildUsageRow(ctx.name, u, (e) => {
+      el.searchResults.classList.add("hidden");
+      el.searchInput.value = "";
+      openFromSearch({ kind: "usage", name: ctx.name, usage: u }, e.shiftKey);
+    }));
+  });
+}
+
 async function runSearch(q) {
   if (!state.project) return;
-  let results = [];
+  const { pathFilter, nameQ } = parseSearchQuery(q);
+
+  if (state.searchMode === "use") {
+    if (!nameQ) {
+      el.searchResults.innerHTML =
+        `<div class="item">${pathFilter ? "调用搜索需写符号名，如 in:fs/ read" : "输入要查找的调用/引用符号名"}</div>`;
+      el.searchResults.classList.remove("hidden");
+      return;
+    }
+    el.searchResults.innerHTML = `<div class="item">查找 ${escapeHtml(nameQ)} 的调用…</div>`;
+    el.searchResults.classList.remove("hidden");
+    try {
+      const list = await fetchUsages(nameQ, pathFilter || null);
+      renderUsageSearchResults(nameQ, list, pathFilter || "");
+    } catch (e) { toast("查找调用失败: " + e.message); }
+    return;
+  }
+
+  el.searchResults.innerHTML = "";
   try {
     results = await api("/api/search", { project: state.project, q, limit: 40 });
   } catch (e) { toast("搜索失败: " + e.message); return; }
 
-  el.searchResults.innerHTML = "";
   if (!results.length) {
     const hint = /^(?:in:|@)/i.test(q)
-      ? "无匹配（检查路径是否在已索引文件内）"
-      : "无匹配符号";
+      ? "无匹配定义（检查路径是否在已索引文件内）"
+      : "无匹配符号定义";
     el.searchResults.innerHTML = `<div class="item">${hint}</div>`;
   } else {
     results.forEach((r) => {
@@ -380,15 +673,112 @@ async function runSearch(q) {
         `<span class="nm">${escapeHtml(r.name)}</span>` +
         `<span class="kind">${escapeHtml(r.kind)}</span>` +
         `<span class="loc">${escapeHtml(r.file)}:${r.start_line}</span>`;
-      div.onclick = () => {
+      div.onclick = (e) => {
         el.searchResults.classList.add("hidden");
         el.searchInput.value = "";
-        openRoot(r.file, r.name, r.start_line);
+        openFromSearch({ kind: "def", result: r }, e.shiftKey);
       };
       el.searchResults.appendChild(div);
     });
+    appendSearchFoot(state.order.length > 0);
   }
   el.searchResults.classList.remove("hidden");
+}
+
+/** 在父面板代码中定位符号，作为搜索连线的来源锚点 */
+function makeSearchFromRef(parentPanel, symbolName) {
+  const d = parentPanel.detail;
+  const re = new RegExp(`\\b${symbolName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+  for (let i = 0; i < d.lines.length; i++) {
+    const m = re.exec(d.lines[i]);
+    if (m) {
+      return {
+        name: symbolName,
+        line: d.start_line + i,
+        col: m.index + 1,
+        refKind: "search",
+      };
+    }
+  }
+  return {
+    name: symbolName,
+    line: d.start_line,
+    col: 1,
+    refKind: "search",
+  };
+}
+
+function getSearchAttachParent() {
+  if (state.focusedPanelId && state.panels.has(state.focusedPanelId)) {
+    return state.focusedPanelId;
+  }
+  if (state.order.length) return state.order[state.order.length - 1];
+  return null;
+}
+
+async function openFromSearch(item, asRoot) {
+  if (asRoot || !state.order.length) {
+    if (item.kind === "usage") {
+      await openRootUsage(item.name, item.usage);
+    } else {
+      const r = item.result;
+      await openRoot(r.file, r.name, r.start_line);
+    }
+    return;
+  }
+  const parentId = getSearchAttachParent();
+  if (!parentId) {
+    if (item.kind === "usage") await openRootUsage(item.name, item.usage);
+    else {
+      const r = item.result;
+      await openRoot(r.file, r.name, r.start_line);
+    }
+    return;
+  }
+  if (item.kind === "usage") {
+    await openSearchUsage(parentId, item.name, item.usage);
+  } else {
+    await openSearchDefinition(parentId, item.result);
+  }
+}
+
+async function openSearchDefinition(parentId, result) {
+  try {
+    const detail = await fetchSymbol(result.file, result.name, result.start_line);
+    const parent = state.panels.get(parentId);
+    const searchRef = makeSearchFromRef(parent, result.name);
+    openPanelFrom(parentId, searchRef, detail);
+  } catch (e) { toast("打开失败: " + e.message); }
+}
+
+async function openSearchUsage(parentId, symbolName, usage) {
+  try {
+    const detail = await api("/api/open_at", {
+      project: state.project, file: usage.file, line: usage.line,
+    });
+    if (!detail) { toast("无法打开该调用位置"); return; }
+    const parent = state.panels.get(parentId);
+    if (parent?.detail && symbolKey(parent.detail) === symbolKey(detail)) {
+      flashLine(parentId, usage.line);
+      focusPanel(parentId);
+      return;
+    }
+    const searchRef = makeSearchFromRef(parent, symbolName);
+    const id = openPanelFrom(parentId, searchRef, detail);
+    setTimeout(() => flashLine(id, usage.line), 120);
+  } catch (e) { toast("打开失败: " + e.message); }
+}
+
+async function openRootUsage(symbolName, usage) {
+  clearAllPanels();
+  try {
+    const detail = await api("/api/open_at", {
+      project: state.project, file: usage.file, line: usage.line,
+    });
+    if (!detail) { toast("无法打开该调用位置"); return; }
+    const id = addPanel(detail, null, null);
+    setTimeout(() => flashLine(id, usage.line), 120);
+  } catch (e) { toast("打开失败: " + e.message); }
 }
 
 // ---------- 打开符号 / 级联 ----------
@@ -397,12 +787,22 @@ async function fetchSymbol(file, name, line) {
   return api("/api/symbol", { project: state.project, file, name, line });
 }
 
+function ensureAutoBookmarkOnRoot() {
+  if (state._restoring) return;
+  if (!state.project || state.order.length !== 1) return;
+  const snap = serializeState();
+  if (!snap) return;
+  syncAutoBookmark(snap);
+}
+
 // 打开为根（清空现有所有面板）
 async function openRoot(file, name, line) {
-  clearAllPanels();
+  await flushTreeBeforeClear();
+  clearAllPanels({ silent: true, skipSave: true });
   try {
     const detail = await fetchSymbol(file, name, line);
     addPanel(detail, null, null);
+    ensureAutoBookmarkOnRoot();
   } catch (e) { toast("打开失败: " + e.message); }
 }
 
@@ -431,6 +831,7 @@ function addPanel(detail, parentId, fromRef) {
   state.focusNew = id;
   render();
   schedulePersist();
+  ensureAutoBookmarkOnRoot();
   return id;
 }
 
@@ -523,14 +924,27 @@ function closePanel(id) {
   toRemove.forEach((pid) => state.panels.delete(pid));
   render();
   schedulePersist();
+  if (!state.order.length) {
+    state.autoBookmarkId = null;
+    persistTreeNow(true);
+  }
 }
 
 function clearAllPanels(opts = {}) {
+  if (!opts.skipSave && !opts.silent && state.order.length) {
+    persistTreeNow(true);
+  }
   state.panels.clear();
   state.order = [];
   state.seq = 0;
+  state.focusedPanelId = null;
   render();
   if (!opts.silent) schedulePersist();
+}
+
+async function flushTreeBeforeClear() {
+  if (!state.order.length) return;
+  persistTreeNow(true);
 }
 
 // 点击任意 token：
@@ -624,21 +1038,8 @@ async function openCandidate(panelId, ref, cand, forceNew = false) {
   } catch (e) { toast("展开失败: " + e.message); }
 }
 
-// 查找用法 → 弹出一个**临时浮动列表**（不进入树，选完即关）
+// 查找用法 → 弹出浮动列表（含目录过滤）
 async function openUsages(panelId, fromRef, anchorEl) {
-  let list = [];
-  try {
-    list = await api("/api/usages", { project: state.project, name: fromRef.name, limit: 300 });
-  } catch (e) { toast("查找用法失败: " + e.message); return; }
-  showUsagesPop(panelId, fromRef, list, anchorEl);
-}
-
-function closeUsagesPop() {
-  const m = document.getElementById("usages-pop");
-  if (m) m.remove();
-}
-
-function showUsagesPop(originPanelId, fromRef, list, anchorEl) {
   closeUsagesPop();
   closeCandidateMenu();
   const pop = document.createElement("div");
@@ -647,28 +1048,34 @@ function showUsagesPop(originPanelId, fromRef, list, anchorEl) {
 
   const head = document.createElement("div");
   head.className = "usages-pop-head";
-  head.innerHTML = `<span>⤢ 用法: ${escapeHtml(fromRef.name)}</span>` +
-    `<span class="cnt">${list.length}</span><span class="x">×</span>`;
+  head.innerHTML =
+    `<span>⤢ 用法: ${escapeHtml(fromRef.name)}</span>` +
+    `<span class="cnt">…</span><span class="x">×</span>`;
   head.querySelector(".x").onclick = closeUsagesPop;
   pop.appendChild(head);
 
+  const filterSlot = document.createElement("div");
+  pop.appendChild(filterSlot);
+
   const body = document.createElement("div");
   body.className = "usages-pop-body";
-  if (!list.length) body.innerHTML = `<div class="usage-row">未找到使用位置</div>`;
-  list.forEach((u) => {
-    const row = document.createElement("div");
-    row.className = "usage-row";
-    row.innerHTML =
-      `<div class="u-loc">${escapeHtml(u.file)}:${u.line}` +
-      (u.enclosing ? ` <span class="u-in">in ${escapeHtml(u.enclosing)}</span>` : "") +
-      `</div><div class="u-snip">${escapeHtml(u.text)}</div>`;
-    row.onclick = (e) => { e.stopPropagation(); openUsageRow(originPanelId, fromRef, u); };
-    body.appendChild(row);
-  });
   pop.appendChild(body);
   document.body.appendChild(pop);
 
-  // 定位到锚点附近，避免超出视口
+  const ctx = {
+    name: fromRef.name,
+    list: [],
+    pathFilter: "",
+    displayLimit: 80,
+    filterBar: null,
+    bodyEl: body,
+    originPanelId: panelId,
+    fromRef,
+    headCnt: head.querySelector(".cnt"),
+    onUpdate: () => renderUsagesPopBody(ctx),
+  };
+  mountUsagePathFilter(filterSlot, ctx);
+
   const rect = anchorEl ? anchorEl.getBoundingClientRect() : { left: 100, bottom: 100 };
   const popW = 460;
   let left = rect.left;
@@ -676,12 +1083,44 @@ function showUsagesPop(originPanelId, fromRef, list, anchorEl) {
   pop.style.left = Math.max(8, left) + "px";
   pop.style.top = (rect.bottom + 6) + "px";
 
-  // 点击别处 / Esc 关闭
   setTimeout(() => {
     document.addEventListener("click", onDocCloseUsages, true);
     document.addEventListener("keydown", onEscCloseUsages);
   }, 0);
+
+  try {
+    ctx.list = await fetchUsages(fromRef.name, null);
+    ctx.onUpdate();
+  } catch (e) {
+    toast("查找用法失败: " + e.message);
+    closeUsagesPop();
+  }
 }
+
+function renderUsagesPopBody(ctx) {
+  const body = ctx.bodyEl;
+  body.innerHTML = "";
+  updateUsageFilterCount(ctx);
+  if (ctx.headCnt) {
+    ctx.headCnt.textContent = String(ctx.list.length);
+  }
+  if (!ctx.list.length) {
+    body.innerHTML = `<div class="usage-row">${ctx.pathFilter ? "该目录下无用法" : "未找到使用位置"}</div>`;
+    return;
+  }
+  ctx.list.slice(0, ctx.displayLimit).forEach((u) => {
+    body.appendChild(buildUsagePopRow(u, (e) => {
+      e.stopPropagation();
+      openUsageRow(ctx.originPanelId, ctx.fromRef, u);
+    }));
+  });
+}
+
+function closeUsagesPop() {
+  const m = document.getElementById("usages-pop");
+  if (m) m.remove();
+}
+
 function onDocCloseUsages(e) {
   const pop = document.getElementById("usages-pop");
   if (pop && !pop.contains(e.target)) {
@@ -772,12 +1211,110 @@ function closeCandidateMenu() {
 }
 
 function focusPanel(id) {
+  state.focusedPanelId = id;
   document.querySelectorAll(".panel").forEach((p) => p.classList.remove("focused"));
   const node = document.querySelector(`.panel[data-id="${id}"]`);
   if (node) {
     node.classList.add("focused");
     node.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
   }
+  syncFuncMapActive();
+}
+
+// ---------- 右侧函数地图（扁平箭头链，无缩进） ----------
+
+/** 路径拆成文件夹链 + 文件名，供地图展示 */
+function splitFilePath(file) {
+  const norm = file.replace(/\\/g, "/");
+  const slash = norm.lastIndexOf("/");
+  if (slash < 0) return { dirs: [], base: norm };
+  return {
+    dirs: norm.slice(0, slash).split("/").filter(Boolean),
+    base: norm.slice(slash + 1),
+  };
+}
+
+/** 目录显示：过长时保留末尾一段 */
+function formatMapDir(dirs) {
+  if (!dirs.length) return "";
+  if (dirs.length <= 2) return dirs.join("/") + "/";
+  return "…/" + dirs[dirs.length - 1] + "/";
+}
+
+function syncFuncMapActive() {
+  if (!el.funcMapBody) return;
+  el.funcMapBody.querySelectorAll(".map-row[data-panel-id]").forEach((n) => {
+    n.classList.toggle("active", n.dataset.panelId === state.focusedPanelId);
+  });
+}
+
+/** 单行：父 → 子（根节点仅显示函数名），点击整行跳到子/自身面板 */
+function renderFuncMapRow(panelId, container) {
+  const panel = state.panels.get(panelId);
+  if (!panel?.detail) return;
+  const d = panel.detail;
+  const parent = panel.parentId ? state.panels.get(panel.parentId) : null;
+  const { dirs, base } = splitFilePath(d.file);
+
+  const row = document.createElement("div");
+  row.className = "map-row" + (panelId === state.focusedPanelId ? " active" : "");
+  row.dataset.panelId = panelId;
+
+  const chain = document.createElement("div");
+  chain.className = "map-chain";
+
+  if (parent?.detail) {
+    const pName = document.createElement("span");
+    pName.className = "map-fn map-fn-parent";
+    pName.title = parent.detail.file;
+    pName.textContent = parent.detail.name;
+    pName.onclick = (e) => {
+      e.stopPropagation();
+      focusPanel(panel.parentId);
+    };
+
+    const arrow = document.createElement("span");
+    arrow.className = "map-arrow";
+    arrow.textContent = "→";
+    arrow.setAttribute("aria-hidden", "true");
+
+    const cName = document.createElement("span");
+    cName.className = "map-fn map-fn-child";
+    cName.title = d.file;
+    cName.textContent = d.name;
+
+    chain.appendChild(pName);
+    chain.appendChild(arrow);
+    chain.appendChild(cName);
+  } else {
+    const cName = document.createElement("span");
+    cName.className = "map-fn map-fn-root";
+    cName.title = d.file;
+    cName.textContent = d.name;
+    chain.appendChild(cName);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "map-meta";
+  meta.innerHTML =
+    `<span class="map-file">${escapeHtml(base)}:${d.start_line}</span>` +
+    (dirs.length ? ` <span class="map-dir" title="${escapeHtml(dirs.join("/"))}">${escapeHtml(formatMapDir(dirs))}</span>` : "");
+
+  row.appendChild(chain);
+  row.appendChild(meta);
+  row.onclick = () => focusPanel(panelId);
+  container.appendChild(row);
+}
+
+function renderFuncMap() {
+  if (!el.funcMapBody) return;
+  el.funcMapBody.innerHTML = "";
+  if (!state.order.length) {
+    el.funcMapBody.innerHTML = '<div class="map-empty">打开函数后显示调用链</div>';
+    return;
+  }
+  // 按打开顺序扁平列出，每行 parent → child，长链也不缩进
+  state.order.forEach((id) => renderFuncMapRow(id, el.funcMapBody));
 }
 
 // ---------- 渲染 ----------
@@ -894,7 +1431,11 @@ function render() {
 
   // 清空旧面板节点与撑尺寸的 sizer（保留 empty-hint）
   [...el.board.querySelectorAll(".panel, .board-sizer")].forEach((n) => n.remove());
-  if (!state.order.length) { drawConnectors(); return; }
+  if (!state.order.length) {
+    drawConnectors();
+    renderFuncMap();
+    return;
+  }
 
   // 创建全部面板节点并绝对定位（位置稍后由 layout 计算）
   for (const id of state.order) {
@@ -902,10 +1443,11 @@ function render() {
     const node = renderPanel(panel);
     panel.el = node;
     el.board.appendChild(node);
+    refreshPanelAi(id);
   }
 
   // 需先完成布局测量，再算高亮与连线
-  requestAnimationFrame(() => { layout(); decorate(); });
+  requestAnimationFrame(() => { layout(); decorate(); renderFuncMap(); });
 }
 
 /*
@@ -1041,8 +1583,7 @@ function layout() {
   sizer.style.top = (maxBottom + LAYOUT.padY) + "px";
 
   if (state.focusNew) {
-    const node = state.panels.get(state.focusNew)?.el;
-    if (node) node.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
+    focusPanel(state.focusNew);
     state.focusNew = null;
   }
 }
@@ -1140,7 +1681,7 @@ function renderPanel(panel) {
   header.querySelector(".close").onclick = (e) => { e.stopPropagation(); closePanel(panel.id); };
   header.querySelector(".ai-open").onclick = (e) => {
     e.stopPropagation();
-    openAiDrawer(panel.id, { selectedText: "" });
+    openPanelAi(panel.id, { selectedText: "" });
   };
   setupPanelDrag(header, panel.id);
   node.appendChild(header);
@@ -1185,6 +1726,12 @@ function renderPanel(panel) {
     showCodeContextMenu(e, panel.id, sel || "", t);
   });
   node.appendChild(code);
+
+  // AI 问答区：与当前符号绑定，内容持久化到 localStorage
+  const aiSec = document.createElement("div");
+  aiSec.className = "panel-ai";
+  node.appendChild(aiSec);
+
   return node;
 }
 
@@ -1332,11 +1879,16 @@ function drawConnectors() {
   }
 }
 
-// ---------- AI 分析（右键 / 面板 ✦ → 侧栏对话，按函数 localStorage 持久化） ----------
+// ---------- AI 分析（右键 / 面板 ✦ → 面板内子区，按符号 localStorage 持久化） ----------
 
 let codeCtxState = null;
 
+/** 与 symbolKey 对齐，避免同函数因 start_line 漂移拆成多条记录 */
 function aiSymbolKey(detail) {
+  return `${state.project}:${symbolKey(detail)}`;
+}
+
+function aiLegacyKey(detail) {
   return `${state.project}:${detail.file}:${detail.start_line}:${detail.name}`;
 }
 
@@ -1349,9 +1901,24 @@ function saveAiStore(store) {
   localStorage.setItem(LS_AI, JSON.stringify(store));
 }
 
+/** 查找记录并迁移旧键（project:file:start_line:name） */
+function resolveAiEntry(store, detail) {
+  const key = aiSymbolKey(detail);
+  if (store[key]) return { key, record: store[key] };
+  const legacy = aiLegacyKey(detail);
+  if (store[legacy]) {
+    store[key] = store[legacy];
+    delete store[legacy];
+    return { key, record: store[key], migrated: true };
+  }
+  return { key, record: null };
+}
+
 function getAiRecord(detail) {
   const store = loadAiStore();
-  return store[aiSymbolKey(detail)] || null;
+  const { record, migrated } = resolveAiEntry(store, detail);
+  if (migrated) saveAiStore(store);
+  return record;
 }
 
 function hasAiNotes(detail) {
@@ -1360,10 +1927,16 @@ function hasAiNotes(detail) {
   return rec.threads.some((t) => t.messages?.length > 0);
 }
 
+function aiMessageCount(detail) {
+  const rec = getAiRecord(detail);
+  if (!rec?.threads?.length) return 0;
+  return rec.threads.reduce((n, t) => n + (t.messages?.length || 0), 0);
+}
+
 function ensureAiRecord(detail) {
   const store = loadAiStore();
-  const key = aiSymbolKey(detail);
-  if (!store[key]) {
+  const { key, record, migrated } = resolveAiEntry(store, detail);
+  if (!record) {
     store[key] = {
       symbol: {
         file: detail.file, name: detail.name,
@@ -1373,6 +1946,7 @@ function ensureAiRecord(detail) {
       threads: [],
     };
   }
+  if (migrated || !record) saveAiStore(store);
   return store[key];
 }
 
@@ -1380,6 +1954,18 @@ function persistAiRecord(detail, record) {
   const store = loadAiStore();
   store[aiSymbolKey(detail)] = record;
   saveAiStore(store);
+}
+
+/** 面板级 UI 状态（展开/当前线程/选中片段），随 panel 对象存活 */
+function ensurePanelAiState(panel) {
+  if (!panel.aiState) {
+    panel.aiState = {
+      expanded: hasAiNotes(panel.detail),
+      threadId: null,
+      selectedText: "",
+    };
+  }
+  return panel.aiState;
 }
 
 function threadTitle(thread) {
@@ -1428,69 +2014,9 @@ function formatAiText(text) {
   return html;
 }
 
-function renderAiUi() {
-  if (!state.ai) return;
-  const panel = state.panels.get(state.ai.panelId);
-  if (!panel?.detail) return;
-  const d = panel.detail;
-  const record = ensureAiRecord(d);
-  persistAiRecord(d, record);
-
-  el.aiDrawerTitle.textContent = `AI · ${d.name}`;
-  el.aiDrawerSub.textContent = `${d.file}:${d.start_line}`;
-  if (state.ai.selectedText) {
-    el.aiDrawerSub.textContent += " · 已选中片段";
-  }
-
-  el.aiThreadList.innerHTML = "";
-  record.threads.forEach((th) => {
-    const pill = document.createElement("button");
-    pill.type = "button";
-    pill.className = "ai-thread-pill" + (th.id === state.ai.threadId ? " active" : "");
-    pill.textContent = threadTitle(th);
-    pill.title = threadTitle(th);
-    pill.onclick = () => {
-      state.ai.threadId = th.id;
-      renderAiUi();
-    };
-    el.aiThreadList.appendChild(pill);
-  });
-
-  const thread = record.threads.find((t) => t.id === state.ai.threadId);
-  el.aiMessages.innerHTML = "";
-  if (!thread || !thread.messages.length) {
-    el.aiMessages.innerHTML =
-      `<div class="ai-hint">可问：这里几种时序/分支情况？多核下可能有什么问题？如何验证？</div>`;
-  } else {
-    thread.messages.forEach((m) => {
-      const div = document.createElement("div");
-      div.className = `ai-msg ai-msg-${m.role}`;
-      const meta = document.createElement("div");
-      meta.className = "ai-msg-meta";
-      meta.textContent = m.role === "user" ? "你" : "AI";
-      const body = document.createElement("div");
-      body.className = "ai-msg-body";
-      body.innerHTML = formatAiText(m.content);
-      div.appendChild(meta);
-      div.appendChild(body);
-      el.aiMessages.appendChild(div);
-    });
-    el.aiMessages.scrollTop = el.aiMessages.scrollHeight;
-  }
-
-  if (state.aiConfigured) {
-    const backend = state.aiBackend || "cursor-agent";
-    el.aiStatus.textContent = `${backend} · ${state.aiModel}`;
-  } else {
-    el.aiStatus.textContent = "请安装 cursor-agent 并 login";
-  }
-}
-
-function openAiDrawer(panelId, opts = {}) {
-  const panel = state.panels.get(panelId);
-  if (!panel?.detail) return;
-  const record = ensureAiRecord(panel.detail);
-  let threadId = opts.threadId;
+function ensurePanelAiThread(panel, record, opts = {}) {
+  const ai = ensurePanelAiState(panel);
+  let threadId = opts.threadId || ai.threadId;
   if (!threadId) {
     if (opts.newThread || opts.selectedText) {
       const th = {
@@ -1518,23 +2044,171 @@ function openAiDrawer(panelId, opts = {}) {
       persistAiRecord(panel.detail, record);
     }
   }
-  state.ai = {
-    panelId,
-    threadId,
-    selectedText: opts.selectedText || "",
-  };
-  document.body.classList.add("ai-open");
-  el.aiDrawer.classList.remove("hidden");
-  renderAiUi();
-  refreshAiPanelBadge(panelId);
-  if (opts.prefill) el.aiInput.value = opts.prefill;
-  el.aiInput.focus();
+  ai.threadId = threadId;
+  if (opts.selectedText) ai.selectedText = opts.selectedText;
+  return threadId;
 }
 
-function closeAiDrawer() {
-  el.aiDrawer.classList.add("hidden");
-  document.body.classList.remove("ai-open");
-  state.ai = null;
+/** 在面板底部渲染 AI 子区（线程、历史消息、输入框） */
+function refreshPanelAi(panelId) {
+  const panel = state.panels.get(panelId);
+  const mount = panel?.el?.querySelector(".panel-ai");
+  if (!panel?.detail || !mount) return;
+
+  const d = panel.detail;
+  const ai = ensurePanelAiState(panel);
+  const record = ensureAiRecord(d);
+  ensurePanelAiThread(panel, record);
+  persistAiRecord(d, record);
+
+  const msgCount = aiMessageCount(d);
+  const thread = record.threads.find((t) => t.id === ai.threadId);
+
+  mount.innerHTML = "";
+  mount.classList.toggle("has-notes", msgCount > 0);
+
+  const head = document.createElement("div");
+  head.className = "panel-ai-head";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "panel-ai-toggle";
+  toggle.innerHTML =
+    `<span class="panel-ai-label">✦ AI 笔记</span>` +
+    (msgCount ? `<span class="panel-ai-count">${msgCount} 条</span>` : "");
+  toggle.onclick = (e) => {
+    e.stopPropagation();
+    ai.expanded = !ai.expanded;
+    refreshPanelAi(panelId);
+  };
+  head.appendChild(toggle);
+
+  const newBtn = document.createElement("button");
+  newBtn.type = "button";
+  newBtn.className = "panel-ai-new";
+  newBtn.title = "新对话";
+  newBtn.textContent = "+";
+  newBtn.onclick = (e) => {
+    e.stopPropagation();
+    openPanelAi(panelId, { newThread: true, selectedText: ai.selectedText || "" });
+  };
+  head.appendChild(newBtn);
+  mount.appendChild(head);
+
+  const body = document.createElement("div");
+  body.className = "panel-ai-body" + (ai.expanded ? "" : " collapsed");
+
+  const threadBar = document.createElement("div");
+  threadBar.className = "panel-ai-thread-bar";
+  const lbl = document.createElement("span");
+  lbl.className = "lbl";
+  lbl.textContent = "历史";
+  threadBar.appendChild(lbl);
+  const threadList = document.createElement("div");
+  threadList.className = "ai-thread-list";
+  record.threads.forEach((th) => {
+    const pill = document.createElement("button");
+    pill.type = "button";
+    pill.className = "ai-thread-pill" + (th.id === ai.threadId ? " active" : "");
+    pill.textContent = threadTitle(th);
+    pill.title = threadTitle(th);
+    pill.onclick = (e) => {
+      e.stopPropagation();
+      ai.threadId = th.id;
+      refreshPanelAi(panelId);
+    };
+    threadList.appendChild(pill);
+  });
+  threadBar.appendChild(threadList);
+  body.appendChild(threadBar);
+
+  if (ai.selectedText) {
+    const selHint = document.createElement("div");
+    selHint.className = "panel-ai-sel-hint";
+    selHint.textContent = "已附带选中代码片段";
+    body.appendChild(selHint);
+  }
+
+  const messages = document.createElement("div");
+  messages.className = "panel-ai-messages ai-messages";
+  if (!thread || !thread.messages.length) {
+    messages.innerHTML =
+      `<div class="ai-hint">可问：这里几种时序/分支情况？多核下可能有什么问题？如何验证？</div>`;
+  } else {
+    thread.messages.forEach((m) => {
+      const div = document.createElement("div");
+      div.className = `ai-msg ai-msg-${m.role}`;
+      const meta = document.createElement("div");
+      meta.className = "ai-msg-meta";
+      meta.textContent = m.role === "user" ? "你" : "AI";
+      const msgBody = document.createElement("div");
+      msgBody.className = "ai-msg-body";
+      msgBody.innerHTML = formatAiText(m.content);
+      div.appendChild(meta);
+      div.appendChild(msgBody);
+      messages.appendChild(div);
+    });
+    requestAnimationFrame(() => { messages.scrollTop = messages.scrollHeight; });
+  }
+  body.appendChild(messages);
+
+  const inputWrap = document.createElement("div");
+  inputWrap.className = "panel-ai-input-wrap ai-input-wrap";
+  const textarea = document.createElement("textarea");
+  textarea.className = "panel-ai-input";
+  textarea.rows = 2;
+  textarea.placeholder = "描述你想分析的问题…（Ctrl+Enter 发送）";
+  textarea.onclick = (e) => e.stopPropagation();
+  textarea.onkeydown = (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      sendPanelAiMessage(panelId, textarea);
+    }
+  };
+  inputWrap.appendChild(textarea);
+  const sendBtn = document.createElement("button");
+  sendBtn.type = "button";
+  sendBtn.className = "panel-ai-send";
+  sendBtn.textContent = "发送";
+  sendBtn.onclick = (e) => {
+    e.stopPropagation();
+    sendPanelAiMessage(panelId, textarea, sendBtn);
+  };
+  inputWrap.appendChild(sendBtn);
+  body.appendChild(inputWrap);
+
+  const status = document.createElement("div");
+  status.className = "panel-ai-status ai-status";
+  if (state.aiConfigured) {
+    status.textContent = `${state.aiBackend || "cursor-agent"} · ${state.aiModel}`;
+  } else {
+    status.textContent = "请安装 cursor-agent 并 login";
+  }
+  body.appendChild(status);
+
+  mount.appendChild(body);
+
+  if (panel._aiPrefill) {
+    textarea.value = panel._aiPrefill;
+    panel._aiPrefill = "";
+  }
+  if (panel._aiFocus) {
+    textarea.focus();
+    panel._aiFocus = false;
+  }
+}
+
+function openPanelAi(panelId, opts = {}) {
+  const panel = state.panels.get(panelId);
+  if (!panel?.detail) return;
+  const record = ensureAiRecord(panel.detail);
+  const ai = ensurePanelAiState(panel);
+  ensurePanelAiThread(panel, record, opts);
+  ai.expanded = true;
+  if (opts.prefill) panel._aiPrefill = opts.prefill;
+  panel._aiFocus = true;
+  refreshPanelAi(panelId);
+  refreshAiPanelBadge(panelId);
+  panel.el?.querySelector(".panel-ai")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function refreshAiPanelBadge(panelId) {
@@ -1542,47 +2216,44 @@ function refreshAiPanelBadge(panelId) {
   const node = panel?.el?.querySelector(".ai-open");
   if (!node || !panel.detail) return;
   const dot = node.querySelector(".ai-dot");
-  if (hasAiNotes(panel.detail) && !dot) {
+  const has = hasAiNotes(panel.detail);
+  if (has && !dot) {
     node.insertAdjacentHTML("beforeend", '<i class="ai-dot"></i>');
+  } else if (!has && dot) {
+    dot.remove();
   }
 }
 
-function newAiThread() {
-  if (!state.ai) return;
-  openAiDrawer(state.ai.panelId, {
-    newThread: true,
-    selectedText: state.ai.selectedText || "",
-  });
-}
-
-async function sendAiMessage() {
-  if (!state.ai) return;
-  const question = el.aiInput.value.trim();
+async function sendPanelAiMessage(panelId, textarea, sendBtn) {
+  const question = textarea.value.trim();
   if (!question) return;
   if (!state.aiConfigured) {
     toast("未配置 cursor-agent（请先 login）");
     return;
   }
 
-  const panel = state.panels.get(state.ai.panelId);
+  const panel = state.panels.get(panelId);
   if (!panel?.detail) return;
   const d = panel.detail;
+  const ai = ensurePanelAiState(panel);
   const record = ensureAiRecord(d);
-  const thread = record.threads.find((t) => t.id === state.ai.threadId);
+  const thread = record.threads.find((t) => t.id === ai.threadId);
   if (!thread) return;
 
   thread.messages.push({
     role: "user", content: question, ts: new Date().toISOString(),
   });
   thread.updatedAt = new Date().toISOString();
-  if (state.ai.selectedText && !thread.selectedText) {
-    thread.selectedText = state.ai.selectedText;
+  if (ai.selectedText && !thread.selectedText) {
+    thread.selectedText = ai.selectedText;
   }
   persistAiRecord(d, record);
-  el.aiInput.value = "";
-  el.aiSend.disabled = true;
-  el.aiSend.textContent = "分析中…";
-  renderAiUi();
+  textarea.value = "";
+  if (sendBtn) {
+    sendBtn.disabled = true;
+    sendBtn.textContent = "分析中…";
+  }
+  refreshPanelAi(panelId);
 
   const source = d.lines.join("\n");
   const history = thread.messages.slice(0, -1).map((m) => ({
@@ -1598,7 +2269,7 @@ async function sendAiMessage() {
       end_line: d.end_line,
       signature: d.signature || "",
       source,
-      selected_text: state.ai.selectedText || thread.selectedText || "",
+      selected_text: ai.selectedText || thread.selectedText || "",
       question,
       history,
       chat_id: thread.chatId || "",
@@ -1609,16 +2280,18 @@ async function sendAiMessage() {
     });
     thread.updatedAt = new Date().toISOString();
     persistAiRecord(d, record);
-    refreshAiPanelBadge(state.ai.panelId);
-    renderAiUi();
+    refreshAiPanelBadge(panelId);
+    refreshPanelAi(panelId);
   } catch (e) {
     toast("AI 分析失败: " + e.message);
     thread.messages.pop();
     persistAiRecord(d, record);
-    renderAiUi();
+    refreshPanelAi(panelId);
   } finally {
-    el.aiSend.disabled = false;
-    el.aiSend.textContent = "发送";
+    if (sendBtn) {
+      sendBtn.disabled = false;
+      sendBtn.textContent = "发送";
+    }
   }
 }
 
@@ -1636,7 +2309,16 @@ async function loadAiConfig() {
 
 // ---------- 事件绑定 ----------
 
+el.funcMapToggle?.addEventListener("click", () => {
+  document.body.classList.toggle("map-collapsed");
+});
+
 el.projectSelect.addEventListener("change", (e) => setProject(e.target.value));
+el.searchMode?.addEventListener("click", (e) => {
+  const btn = e.target.closest(".search-mode-btn");
+  if (!btn) return;
+  setSearchMode(btn.dataset.mode);
+});
 el.searchInput.addEventListener("input", onSearchInput);
 el.searchInput.addEventListener("focus", onSearchInput);
 el.btnSaveBookmark.addEventListener("click", openBookmarkDialog);
@@ -1661,7 +2343,7 @@ el.codeCtxMenu.addEventListener("click", (e) => {
   const { panelId, selectedText, tokenEl } = codeCtxState;
   closeCodeContextMenu();
   if (action === "ai") {
-    openAiDrawer(panelId, {
+    openPanelAi(panelId, {
       selectedText,
       prefill: selectedText
         ? "请分析以下选中代码可能的几种情况（时序/分支/多核）："
@@ -1669,16 +2351,6 @@ el.codeCtxMenu.addEventListener("click", (e) => {
     });
   } else if (action === "usages" && tokenEl) {
     navFromToken(panelId, tokenEl, { type: "contextmenu" });
-  }
-});
-
-el.aiDrawerClose.addEventListener("click", closeAiDrawer);
-el.aiNewThread.addEventListener("click", newAiThread);
-el.aiSend.addEventListener("click", sendAiMessage);
-el.aiInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-    e.preventDefault();
-    sendAiMessage();
   }
 });
 

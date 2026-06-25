@@ -17,6 +17,10 @@ projects:
     name: "Linux 内核 - cpuidle (C)"
     root: /path/to/linux-stable
     language: c
+    extra_languages: [asm]
+    # 可选：编译数据库，按实际编译的 arch 消歧多 arch 同名定义。
+    # 生成：make ARCH=arm64 <你的配置> && make compile_commands.json
+    # compile_commands: compile_commands.json
     include_paths:
       - drivers/cpuidle
       - drivers/cpufreq
@@ -24,6 +28,8 @@ projects:
       - kernel/time
       - include/linux
       - include/asm-generic
+      - arch/arm64/kernel
+      - arch/arm64/mm
     exclude_dirs: [.git, tools, Documentation, samples]
 
   - id: chipyard

@@ -15,7 +15,13 @@
       <select id="project-select" title="选择项目"></select>
 
       <div class="search-wrap">
-        <input id="search-input" type="text" placeholder="符号名 或 in:nemu/ main" autocomplete="off" title="路径：in:nemu/ main（仅 nemu 目录）、in:nemu main（含 platform/nemu）" />
+        <div class="search-bar">
+          <div id="search-mode" class="search-mode" title="定义=符号定义；调用=引用/调用位置">
+            <button type="button" class="search-mode-btn active" data-mode="def">定义</button>
+            <button type="button" class="search-mode-btn" data-mode="use">调用</button>
+          </div>
+          <input id="search-input" type="text" placeholder="符号名 或 in:nemu/ main" autocomplete="off" title="定义/调用切换；in:nemu/ main 限定路径；有调用树时点击结果会挂到当前面板，Shift+点击新开根" />
+        </div>
         <div id="search-results" class="search-results hidden"></div>
       </div>
 
@@ -41,17 +47,31 @@
     </div>
   </div>
 
-  <!-- 级联面板容器：按调用深度横向排列，分支在同列纵向堆叠 -->
-  <main id="board" class="board">
-    <div id="empty-hint" class="empty-hint">
-      <h2>开始浏览</h2>
-      <p>① 选择上方项目 → ② 搜索一个函数并打开（可用 <code>in:nemu main</code> 限定路径）→ ③ 点击函数体内的<strong>蓝色调用</strong>，会在右侧展开它的定义。</p>
-      <p>浏览状态会<strong>自动保存</strong>，刷新或重启后会恢复；也可点顶栏「保存到标签」把当前代码树存成书签。</p>
-      <p>同一函数已在树中时会<strong>复用面板</strong>；按住 <kbd>Shift</kbd> 点击可强制新开。</p>
-      <p><strong>拖动</strong>标题栏可移动面板，其余子面板会自动避让重排；<strong>双击</strong>标题栏恢复自动布局。</p>
-      <p>代码区<strong>任意位置右键 → AI 分析</strong>（无需先选中文本），或在面板标题栏点 ✦；分析记录按函数保存。</p>
-    </div>
-  </main>
+  <!-- 级联面板 + 右侧函数地图 -->
+  <div class="main-wrap">
+    <main id="board" class="board">
+      <div id="empty-hint" class="empty-hint">
+        <h2>开始浏览</h2>
+        <p>① 选择上方项目 → ② 搜索（<strong>定义</strong>/<strong>调用</strong>切换；<code>in:nemu/ main</code> 限定路径）→ ③ 点击函数体内<strong>蓝色调用</strong>向右展开定义。</p>
+        <p>已有调用树时，搜索结果默认<strong>挂到当前面板</strong>保留上下文；<kbd>Shift</kbd>+点击搜索结果可<strong>新开根</strong>替换整棵树。</p>
+        <p>右侧<strong>函数地图</strong>以 <code>父 → 子</code> 扁平列出调用链，点击跳到对应面板。</p>
+        <p>浏览状态会<strong>自动保存</strong>，刷新或重启后会恢复；也可点顶栏「保存到标签」把当前代码树存成书签。</p>
+        <p>同一函数已在树中时会<strong>复用面板</strong>；按住 <kbd>Shift</kbd> 点击可强制新开。</p>
+        <p><strong>拖动</strong>标题栏可移动面板，其余子面板会自动避让重排；<strong>双击</strong>标题栏恢复自动布局。</p>
+        <p>代码区<strong>任意位置右键 → AI 分析</strong>（无需先选中文本），或在面板标题栏点 ✦；分析记录按函数保存。</p>
+      </div>
+    </main>
+
+    <aside id="func-map" class="func-map" aria-label="函数地图">
+      <div class="func-map-head">
+        <span class="func-map-title">函数地图</span>
+        <button type="button" id="func-map-toggle" class="func-map-toggle" title="收起/展开">›</button>
+      </div>
+      <div id="func-map-body" class="func-map-body">
+        <div class="map-empty">打开函数后显示导航树</div>
+      </div>
+    </aside>
+  </div>
 
   <!-- 代码区右键菜单 -->
   <div id="code-ctx-menu" class="code-ctx-menu hidden">
@@ -59,28 +79,6 @@
     <div class="ctx-item" data-action="usages">⤢ 查找用法（标识符）</div>
   </div>
 
-  <!-- AI 分析侧栏：对话 + 历史记录（按函数持久化到 localStorage） -->
-  <aside id="ai-drawer" class="ai-drawer hidden" aria-label="AI 分析">
-    <div class="ai-drawer-head">
-      <div>
-        <div class="ai-drawer-title" id="ai-drawer-title">AI 分析</div>
-        <div class="ai-drawer-sub" id="ai-drawer-sub"></div>
-      </div>
-      <button type="button" id="ai-drawer-close" class="ai-close" title="关闭">×</button>
-    </div>
-    <div class="ai-thread-bar">
-      <span class="lbl">历史</span>
-      <div id="ai-thread-list" class="ai-thread-list"></div>
-      <button type="button" id="ai-new-thread" class="ai-new-thread" title="新对话">+</button>
-    </div>
-    <div id="ai-messages" class="ai-messages"></div>
-    <div class="ai-input-wrap">
-      <textarea id="ai-input" rows="3" placeholder="描述你想分析的问题，例如：这里几种时序情况？多核下可能出什么问题？"></textarea>
-      <button type="button" id="ai-send">发送</button>
-    </div>
-    <div id="ai-status" class="ai-status"></div>
-  </aside>
-
-  <script src="/static/app.js?v=20260604i"></script>
+  <script src="/static/app.js?v=20260616c"></script>
 </body>
 </html>

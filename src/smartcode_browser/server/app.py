@@ -143,10 +143,11 @@ def create_app(engine: CodeEngine | None = None) -> FastAPI:
         project: str = Query(...),
         name: str = Query(...),
         limit: int = Query(200, ge=1, le=1000),
+        path: str | None = Query(None, description="相对路径过滤，如 fs/ 或 drivers/mmc"),
     ) -> list[dict]:
         """查找标识符的所有使用位置（按所属函数聚合）。"""
         try:
-            return engine.find_usages(project, name, limit)
+            return engine.find_usages(project, name, limit, path)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
