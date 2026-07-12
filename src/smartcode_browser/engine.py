@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from .debug_profiles import load_debug_profiles, suggest_debug_profile
 from .index import SymbolIndex
 from .models import Definition, ResolvedReference, Symbol, SymbolDetail
 from .registry import Project, ProjectRegistry
@@ -38,6 +39,57 @@ class CodeEngine:
 
     def project_stats(self, project_id: str) -> dict:
         return self._index(project_id).stats
+
+    def compile_context(self, project_id: str, file: str) -> dict:
+        """返回某源文件的编译上下文（-D/-I、对应 TU），供面板展示与 GDB 断点。"""
+        project = self.registry.get(project_id)
+        index = self._index(project_id)
+        db = index.compiledb
+        if not db:
+            return {"available": False, "reason": "未配置 compile_commands.json"}
+        ctx = db.context_for(file)
+        root = project.root.resolve()
+        ctx["gdb_break_template"] = f"break {root / file}:{{line}}"
+        ctx["gdb_break_rel"] = f"break {file}:{{line}}"
+        prof = self.suggest_debug_profile(project_id, file)
+        if prof:
+            ctx["debug_profile_id"] = prof["id"]
+            ctx["debug_profile_name"] = prof["name"]
+        return ctx
+
+    def debug_profiles(self, project_id: str) -> list[dict]:
+        """列出项目的 GDB 调试配置（launch.json + registry）。"""
+        project = self.registry.get(project_id)
+        profiles = load_debug_profiles(project.root, project.debug_profiles)
+        return [p.to_dict() for p in profiles]
+
+    def suggest_debug_profile(self, project_id: str, file: str) -> dict | None:
+        """按源码路径推荐 GDB 配置；无匹配时回退 registry 的 default_debug_profile。"""
+        project = self.registry.get(project_id)
+        profiles = load_debug_profiles(project.root, project.debug_profiles)
+        usable = [p for p in profiles if not p.needs_input]
+        if not usable:
+            return None
+        matched = suggest_debug_profile(usable, file)
+        if matched:
+            return matched.to_dict()
+        if project.default_debug_profile:
+            for p in usable:
+                if p.id == project.default_debug_profile:
+                    return p.to_dict()
+        return None
+
+    def gdb_break_command(
+        self, project_id: str, file: str, line: int, *, absolute: bool = True
+    ) -> dict:
+        """生成单行 GDB break 命令。"""
+        project = self.registry.get(project_id)
+        rel = file.replace("\\", "/")
+        if absolute:
+            cmd = f"break {project.root.resolve() / rel}:{line}"
+        else:
+            cmd = f"break {rel}:{line}"
+        return {"command": cmd, "file": rel, "line": line}
 
     # --- 搜索 ---
 

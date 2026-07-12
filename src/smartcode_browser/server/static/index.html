@@ -20,7 +20,7 @@
             <button type="button" class="search-mode-btn active" data-mode="def">定义</button>
             <button type="button" class="search-mode-btn" data-mode="use">调用</button>
           </div>
-          <input id="search-input" type="text" placeholder="符号名 或 in:nemu/ main" autocomplete="off" title="定义/调用切换；in:nemu/ main 限定路径；有调用树时点击结果会挂到当前面板，Shift+点击新开根" />
+          <input id="search-input" type="text" placeholder="符号名 或 in:nemu/ main" autocomplete="off" title="定义/调用切换；in: 限定路径；点击搜索结果=新开根节点；Shift+点击挂到当前面板；Ctrl+点击替换整棵树" />
         </div>
         <div id="search-results" class="search-results hidden"></div>
       </div>
@@ -33,12 +33,21 @@
       <button id="btn-save-bookmark" type="button" title="把当前代码树保存为命名标签">保存到标签</button>
       <div id="bookmark-list" class="bookmark-list" title="点击标签恢复对应代码树"></div>
     </div>
+
+    <!-- GDB：从 .vscode/launch.json 读取配置，导出断点脚本 -->
+    <div class="debug-bar" title="配合本机 GDB 调试（读取项目 launch.json）">
+      <select id="debug-profile-select" title="GDB 启动配置">
+        <option value="">调试配置…</option>
+      </select>
+      <button id="btn-export-gdb" type="button" title="按当前调用树生成 GDB 脚本并复制">导出 GDB 脚本</button>
+    </div>
   </header>
 
   <!-- 保存标签对话框 -->
   <div id="bookmark-dialog" class="bookmark-dialog hidden">
     <div class="bookmark-dialog-inner">
       <div class="bookmark-dialog-title">保存当前代码树</div>
+      <p class="bookmark-dialog-hint">每次保存会新建一条标签；若从顶栏手动标签打开，则保存时更新该标签</p>
       <input id="bookmark-name-input" type="text" placeholder="例如：cpuidle → do_idle" autocomplete="off" />
       <div class="bookmark-dialog-actions">
         <button id="bookmark-save-ok" type="button">保存</button>
@@ -53,7 +62,7 @@
       <div id="empty-hint" class="empty-hint">
         <h2>开始浏览</h2>
         <p>① 选择上方项目 → ② 搜索（<strong>定义</strong>/<strong>调用</strong>切换；<code>in:nemu/ main</code> 限定路径）→ ③ 点击函数体内<strong>蓝色调用</strong>向右展开定义。</p>
-        <p>已有调用树时，搜索结果默认<strong>挂到当前面板</strong>保留上下文；<kbd>Shift</kbd>+点击搜索结果可<strong>新开根</strong>替换整棵树。</p>
+        <p>已有调用树时，搜索<strong>点击</strong>会<strong>新开根节点</strong>与现有树并列；<kbd>Shift</kbd>+点击挂到当前面板；<kbd>Ctrl</kbd>+点击替换整棵树。</p>
         <p>右侧<strong>函数地图</strong>以 <code>父 → 子</code> 扁平列出调用链，点击跳到对应面板。</p>
         <p>浏览状态会<strong>自动保存</strong>，刷新或重启后会恢复；也可点顶栏「保存到标签」把当前代码树存成书签。</p>
         <p>同一函数已在树中时会<strong>复用面板</strong>；按住 <kbd>Shift</kbd> 点击可强制新开。</p>
@@ -77,8 +86,10 @@
   <div id="code-ctx-menu" class="code-ctx-menu hidden">
     <div class="ctx-item" data-action="ai">✦ AI 分析选中代码</div>
     <div class="ctx-item" data-action="usages">⤢ 查找用法（标识符）</div>
+    <div class="ctx-item" data-action="gdb-break">⛭ 复制 GDB 断点（此行）</div>
+    <div class="ctx-item" data-action="gdb-fn-break">⛭ 复制 GDB 断点（函数入口）</div>
   </div>
 
-  <script src="/static/app.js?v=20260616c"></script>
+  <script src="/static/app.js?v=20260626b"></script>
 </body>
 </html>

@@ -10,6 +10,11 @@
   --accent: #58a6ff;        /* 可点击引用 */
   --accent-hover: #79c0ff;
   --unresolved: #6e7681;    /* 无法解析的引用 */
+  /* 面板间连线：语义不同则颜色/方向不同（见 app.js classifyLink） */
+  --link-call: #58a6ff;         /* A 调用 B → */
+  --link-reference: #3fb950;    /* A 引用 B（变量/类型）→ */
+  --link-usage: #d2a8ff;        /* B 使用 A ←（查用法，箭头指向定义） */
+  --link-correlation: #ffb14d;  /* 搜索/关联探索 →（虚线） */
   --line-no: #484f58;
   --highlight: rgba(187, 128, 9, 0.28); /* 来源行高亮 */
   /* 面板宽度自适应代码内容，仅约束上下界 */
@@ -228,6 +233,7 @@ html, body {
 }
 .bookmark-pill.auto { border-color: rgba(210, 153, 34, 0.45); }
 .bookmark-pill.auto .bm-name { color: #d29922; }
+.bookmark-pill {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -255,6 +261,35 @@ html, body {
 }
 .bookmark-pill .bm-del:hover { color: #f85149; background: rgba(248,81,73,0.12); }
 
+/* --- GDB 调试栏（读取 launch.json） --- */
+.debug-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+#debug-profile-select {
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 11px;
+  max-width: 160px;
+}
+#btn-export-gdb {
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#btn-export-gdb:hover { border-color: #3fb950; color: #3fb950; }
+#btn-export-gdb:disabled { opacity: 0.45; cursor: not-allowed; }
+
 .bookmark-dialog {
   position: fixed;
   inset: 0;
@@ -272,7 +307,13 @@ html, body {
   width: min(420px, 92vw);
   box-shadow: 0 12px 40px rgba(0,0,0,0.5);
 }
-.bookmark-dialog-title { font-size: 14px; font-weight: 600; margin-bottom: 10px; }
+.bookmark-dialog-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.bookmark-dialog-hint {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin: 0 0 10px;
+  line-height: 1.4;
+}
 #bookmark-name-input {
   width: 100%;
   background: var(--bg);
@@ -426,6 +467,17 @@ body.map-collapsed .func-map-toggle {
 }
 .map-row.active .map-fn-child,
 .map-row.active .map-fn-root { color: #79c0ff; }
+.map-root-tag {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  color: #d29922;
+  border: 1px solid rgba(210,153,34,0.45);
+  border-radius: 3px;
+  padding: 0 3px;
+  margin-right: 4px;
+  vertical-align: 1px;
+}
 .map-meta {
   color: var(--text-dim);
   font-size: 10px;
@@ -504,6 +556,59 @@ body.map-collapsed .func-map-toggle {
   white-space: pre-wrap;
   max-height: 80px;
   overflow-y: auto;
+}
+
+.panel-compile {
+  padding: 4px 10px 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+  background: rgba(63, 185, 80, 0.04);
+  line-height: 1.45;
+}
+.panel-compile.hidden { display: none; }
+.panel-compile .compile-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.panel-compile .compile-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid rgba(63, 185, 80, 0.45);
+  color: #3fb950;
+  flex-shrink: 0;
+}
+.panel-compile .compile-badge.hdr {
+  border-color: rgba(210, 153, 34, 0.45);
+  color: #d29922;
+}
+.panel-compile .compile-badge.none {
+  border-color: var(--border);
+  color: var(--text-dim);
+}
+.panel-compile .compile-body {
+  margin-top: 4px;
+  display: none;
+}
+.panel-compile.open .compile-body { display: block; }
+.panel-compile .compile-debug {
+  font-size: 10px;
+  color: #3fb950;
+  margin-bottom: 4px;
+}
+  font-family: "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10px;
+  word-break: break-all;
+}
+.panel-header .compile-dot {
+  font-size: 10px;
+  color: #3fb950;
+  cursor: help;
+  flex-shrink: 0;
 }
 
 .panel-code {
@@ -597,9 +702,15 @@ body.map-collapsed .func-map-toggle {
 }
 #connectors path.link {
   fill: none;
-  stroke: var(--accent);
   stroke-width: 2;
-  opacity: 0.75;
+  opacity: 0.82;
+}
+#connectors path.link-call { stroke: var(--link-call); }
+#connectors path.link-reference { stroke: var(--link-reference); }
+#connectors path.link-usage { stroke: var(--link-usage); }
+#connectors path.link-correlation {
+  stroke: var(--link-correlation);
+  stroke-dasharray: 6 4;
 }
 
 /* 用法弹窗（临时浮层，选完即关，不进入树） */
@@ -833,6 +944,31 @@ body.map-collapsed .func-map-toggle {
 }
 
 /* 面板标题栏 AI 按钮 */
+.panel-header .reparent-src {
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.panel-header .reparent-src:hover { color: var(--link-correlation); background: rgba(255,177,77,0.12); }
+.panel.reparent-target {
+  outline: 2px solid var(--link-correlation);
+  outline-offset: 2px;
+}
+.panel.reparent-candidate {
+  outline: 1px dashed rgba(255,177,77,0.55);
+  outline-offset: 1px;
+}
+body.reparent-mode .panel.reparent-candidate .panel-code .ref {
+  box-shadow: 0 0 0 1px rgba(255,177,77,0.45);
+  cursor: crosshair;
+}
+body.reparent-mode .panel.reparent-candidate .panel-header {
+  cursor: crosshair;
+}
+
 .panel-header .ai-open {
   color: #d2a8ff; cursor: pointer; font-size: 14px; padding: 0 4px;
   position: relative; flex-shrink: 0;

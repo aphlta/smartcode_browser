@@ -54,6 +54,50 @@ def create_app(engine: CodeEngine | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/compile_context")
+    def compile_context(
+        project: str = Query(...),
+        file: str = Query(...),
+    ) -> dict:
+        """返回文件的编译上下文（-D/-I、翻译单元），供面板与 GDB 使用。"""
+        try:
+            return engine.compile_context(project, file)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/debug/profiles")
+    def debug_profiles(project: str = Query(...)) -> list[dict]:
+        """列出项目 GDB 调试配置（来自 .vscode/launch.json）。"""
+        try:
+            return engine.debug_profiles(project)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/debug/break")
+    def gdb_break(
+        project: str = Query(...),
+        file: str = Query(...),
+        line: int = Query(..., ge=1),
+        absolute: bool = Query(True),
+    ) -> dict:
+        """生成 GDB break 命令（默认绝对路径，便于粘贴到终端）。"""
+        try:
+            return engine.gdb_break_command(project, file, line, absolute=absolute)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/debug/suggest")
+    def debug_suggest(
+        project: str = Query(...),
+        file: str = Query(...),
+    ) -> dict:
+        """按源码路径推荐 GDB 调试配置。"""
+        try:
+            prof = engine.suggest_debug_profile(project, file)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return prof or {}
+
     @app.get("/api/search")
     def search(
         project: str = Query(...),

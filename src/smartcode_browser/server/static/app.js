@@ -17,14 +17,19 @@ const state = {
   aiBackend: "",
   searchMode: "def", // def=定义 | use=调用位置
   focusedPanelId: null,
+  debugProfiles: [],    // 来自 .vscode/launch.json 的 GDB 配置
   autoBookmarkId: null,   // 当前树对应的自动同步标签 id
   autoBookmarkName: null, // 用户自定义标签名（再次保存时沿用）
+  manualBookmarkId: null, // 当前关联的手动标签 id（仅 load 手动标签后用于编辑回写）
+  manualBookmarkLoaded: false, // true = 从顶栏手动标签打开，编辑时同步回该标签
+  reparentTargetId: null, // 切换箭头来源模式：待改父链的目标面板 id
 };
 
 // localStorage 键：上次会话 + 用户命名的标签书签 + AI 分析记录
 const LS_SESSION = "smartcode-browser-session-v1";
 const LS_BOOKMARKS = "smartcode-browser-bookmarks-v1";
 const LS_AI = "smartcode-browser-ai-v1";
+const LS_DEBUG_PROFILE = "smartcode-browser-debug-profile-v1";
 
 const el = {
   projectSelect: document.getElementById("project-select"),
@@ -40,6 +45,8 @@ const el = {
   bookmarkNameInput: document.getElementById("bookmark-name-input"),
   bookmarkSaveOk: document.getElementById("bookmark-save-ok"),
   bookmarkSaveCancel: document.getElementById("bookmark-save-cancel"),
+  debugProfileSelect: document.getElementById("debug-profile-select"),
+  btnExportGdb: document.getElementById("btn-export-gdb"),
   codeCtxMenu: document.getElementById("code-ctx-menu"),
   funcMap: document.getElementById("func-map"),
   funcMapBody: document.getElementById("func-map-body"),
@@ -84,6 +91,232 @@ async function apiPost(path, body) {
   const detail = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(detail.detail || resp.statusText);
   return detail;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("已复制到剪贴板");
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+      toast("已复制到剪贴板");
+      return true;
+    } catch {
+      toast("复制失败");
+      return false;
+    } finally {
+      ta.remove();
+    }
+  }
+}
+
+// ---------- 编译上下文 / GDB ----------
+
+async function loadDebugProfiles(projectId) {
+  state.debugProfiles = [];
+  if (!projectId) {
+    refreshDebugProfileSelect();
+    return;
+  }
+  try {
+    state.debugProfiles = await api("/api/debug/profiles", { project: projectId });
+  } catch {
+    state.debugProfiles = [];
+  }
+  refreshDebugProfileSelect();
+  await autoSelectDebugProfile();
+}
+
+function debugProfileStore() {
+  try {
+    return JSON.parse(localStorage.getItem(LS_DEBUG_PROFILE)) || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveDebugProfileChoice(profileId) {
+  if (!state.project || !profileId) return;
+  const s = debugProfileStore();
+  s[state.project] = profileId;
+  localStorage.setItem(LS_DEBUG_PROFILE, JSON.stringify(s));
+}
+
+async function autoSelectDebugProfile(hintFile) {
+  const root = state.order[0] && state.panels.get(state.order[0]);
+  const file = hintFile || root?.detail?.file;
+  if (!file || !state.debugProfiles.length) return;
+
+  try {
+    const prof = await api("/api/debug/suggest", { project: state.project, file });
+    if (prof?.id && state.debugProfiles.some((p) => p.id === prof.id)) {
+      el.debugProfileSelect.value = prof.id;
+      saveDebugProfileChoice(prof.id);
+      return;
+    }
+  } catch {
+    /* 无推荐时回退用户上次选择 */
+  }
+  const stored = debugProfileStore()[state.project];
+  if (stored && state.debugProfiles.some((p) => p.id === stored && !p.needs_input)) {
+    el.debugProfileSelect.value = stored;
+  }
+}
+
+function refreshDebugProfileSelect() {
+  const sel = el.debugProfileSelect;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">调试配置…</option>';
+  state.debugProfiles.forEach((p) => {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    let label = p.name;
+    if (p.needs_input) label += "（需填路径）";
+    opt.textContent = label;
+    opt.title = `${p.program}\ncwd: ${p.cwd}`;
+    sel.appendChild(opt);
+  });
+  if (prev && state.debugProfiles.some((p) => p.id === prev)) sel.value = prev;
+  el.btnExportGdb.disabled = !state.debugProfiles.length;
+}
+
+function selectedDebugProfile() {
+  const id = el.debugProfileSelect.value;
+  return state.debugProfiles.find((p) => p.id === id) || null;
+}
+
+async function fetchPanelCompileContext(panel) {
+  if (!state.project || !panel?.detail?.file || panel._compileCtx) return;
+  try {
+    panel._compileCtx = await api("/api/compile_context", {
+      project: state.project,
+      file: panel.detail.file,
+    });
+    updatePanelCompileUi(panel);
+  } catch {
+    panel._compileCtx = { available: false };
+  }
+}
+
+function updatePanelCompileUi(panel) {
+  const node = panel?.el;
+  const ctx = panel?._compileCtx;
+  if (!node || !ctx?.available) return;
+
+  let strip = node.querySelector(".panel-compile");
+  if (!strip) {
+    strip = document.createElement("div");
+    strip.className = "panel-compile hidden";
+    const code = node.querySelector(".panel-code");
+    node.insertBefore(strip, code || null);
+  }
+
+  const d = panel.detail;
+  const compiled = ctx.direct_compiled;
+  const tu = ctx.tu_file;
+  const badgeCls = compiled ? "compile-badge" : tu ? "compile-badge hdr" : "compile-badge none";
+  const badgeText = compiled ? "已编译 TU" : tu ? `头文件 · TU=${tu.split("/").pop()}` : "无编译信息";
+  const macros = (ctx.defines || []).slice(0, 12);
+  const more = (ctx.defines_total || 0) - macros.length;
+
+  const dbgHint = ctx.debug_profile_name
+    ? `<div class="compile-debug">GDB：${escapeHtml(ctx.debug_profile_name)}</div>`
+    : "";
+
+  strip.innerHTML =
+    `<div class="compile-head">` +
+    `<span class="${badgeCls}">${escapeHtml(badgeText)}</span>` +
+    `<span class="compile-summary">${macros.length ? escapeHtml(macros.slice(0, 3).join("  ")) : "点击展开 -D 宏"}${more > 0 ? ` …+${more}` : ""}</span>` +
+    `</div>` +
+    `<div class="compile-body">` +
+    dbgHint +
+    (macros.length
+      ? `<div class="compile-macros">${escapeHtml(macros.join("  "))}${more > 0 ? ` … 共 ${ctx.defines_total} 个 -D` : ""}</div>`
+      : `<div class="compile-macros">（无 -D 或未匹配到翻译单元）</div>`) +
+    `</div>`;
+  strip.classList.remove("hidden");
+  strip.querySelector(".compile-head").onclick = (e) => {
+    e.stopPropagation();
+    strip.classList.toggle("open");
+  };
+
+  let dot = node.querySelector(".panel-header .compile-dot");
+  if (!dot) {
+    dot = document.createElement("span");
+    dot.className = "compile-dot";
+    const header = node.querySelector(".panel-header");
+    const fileSpan = header?.querySelector(".file");
+    if (header && fileSpan) header.insertBefore(dot, fileSpan);
+  }
+  dot.textContent = compiled ? "●" : tu ? "◐" : "";
+  dot.title = compiled
+    ? `已编译：${tu || d.file}\n${(ctx.defines || []).slice(0, 8).join("\n")}`
+    : tu
+      ? `头文件，关联 TU：${tu}`
+      : "未在 compile_commands 中找到对应翻译单元";
+}
+
+async function copyGdbBreak(file, line) {
+  if (!state.project || !file || !line) return;
+  try {
+    const r = await api("/api/debug/break", {
+      project: state.project,
+      file,
+      line,
+      absolute: true,
+    });
+    await copyText(r.command);
+  } catch (e) {
+    toast("生成断点失败: " + e.message);
+  }
+}
+
+async function exportGdbScript() {
+  const profile = selectedDebugProfile();
+  if (!profile) {
+    toast("请先选择调试配置");
+    el.debugProfileSelect.focus();
+    return;
+  }
+  if (profile.needs_input) {
+    toast("该配置含 ${input:...} 占位，请在 VS Code launch.json 中改用固定路径");
+    return;
+  }
+  if (!state.order.length) {
+    toast("当前没有调用树，无法导出断点");
+    return;
+  }
+  const lines = [
+    "# SmartCode Browser — GDB 脚本（粘贴到终端：gdb -x script.gdb）",
+    `# 配置：${profile.name}`,
+    `cd ${profile.cwd}`,
+    `file ${profile.program}`,
+  ];
+  (profile.setup || []).forEach((cmd) => lines.push(cmd));
+  for (const id of state.order) {
+    const p = state.panels.get(id);
+    if (!p?.detail) continue;
+    try {
+      const r = await api("/api/debug/break", {
+        project: state.project,
+        file: p.detail.file,
+        line: p.detail.start_line,
+        absolute: true,
+      });
+      lines.push(`# ${p.detail.name}`);
+      lines.push(r.command);
+    } catch {
+      lines.push(`# break ${p.detail.file}:${p.detail.start_line}`);
+    }
+  }
+  lines.push("run");
+  await copyText(lines.join("\n"));
 }
 
 // ---------- 会话持久化（刷新/重启后自动恢复 + 命名标签） ----------
@@ -163,11 +396,44 @@ function findAutoBookmarkId(project, fingerprint) {
   return null;
 }
 
+/** 丢弃当前树的标签绑定（须在 flushTreeBeforeClear 之后调用） */
+function resetBookmarkTracking() {
+  state.autoBookmarkId = null;
+  state.autoBookmarkName = null;
+  state.manualBookmarkId = null;
+  state.manualBookmarkLoaded = false;
+}
+
 function syncAutoBookmark(snap) {
   if (!snap?.panels?.length) return;
   const fp = treeFingerprint(snap);
   const bookmarks = loadBookmarksStore();
-  let id = state.autoBookmarkId || findAutoBookmarkId(snap.project, fp);
+
+  // 仅从顶栏「手动标签」打开的树：编辑时写回该标签（自动标签仍单独维护）
+  if (
+    state.manualBookmarkLoaded &&
+    state.manualBookmarkId &&
+    bookmarks[state.manualBookmarkId] &&
+    !bookmarks[state.manualBookmarkId].auto
+  ) {
+    const id = state.manualBookmarkId;
+    const name = state.autoBookmarkName || bookmarks[id].name;
+    bookmarks[id] = {
+      ...bookmarks[id],
+      name,
+      savedAt: new Date().toISOString(),
+      session: snap,
+      fingerprint: fp,
+    };
+    saveBookmarksStore(bookmarks);
+    state.autoBookmarkName = name;
+    renderBookmarkList();
+  }
+
+  let id = state.autoBookmarkId;
+  // 手动保存的书签 id 不能参与自动同步，否则会覆盖用户命名的标签
+  if (id && bookmarks[id] && !bookmarks[id].auto) id = null;
+  if (!id) id = findAutoBookmarkId(snap.project, fp);
   if (!id) id = "bm-auto-" + Date.now();
   const name =
     state.autoBookmarkName ||
@@ -182,7 +448,7 @@ function syncAutoBookmark(snap) {
   };
   saveBookmarksStore(bookmarks);
   state.autoBookmarkId = id;
-  state.autoBookmarkName = name;
+  if (!state.autoBookmarkName) state.autoBookmarkName = name;
   renderBookmarkList();
 }
 
@@ -246,6 +512,7 @@ function openBookmarkDialog() {
   el.bookmarkNameInput.value =
     state.autoBookmarkName ||
     loadBookmarksStore()[state.autoBookmarkId]?.name ||
+    loadBookmarksStore()[state.manualBookmarkId]?.name ||
     defaultBookmarkName();
   el.bookmarkDialog.classList.remove("hidden");
   el.bookmarkNameInput.focus();
@@ -269,20 +536,27 @@ function saveCurrentAsBookmark() {
     return;
   }
   const bookmarks = loadBookmarksStore();
-  const id = state.autoBookmarkId || ("bm-" + Date.now());
+  // 仅当从顶栏手动标签打开时更新原标签；否则每次「保存到标签」都新建一条
+  const updatingManual =
+    state.manualBookmarkLoaded &&
+    state.manualBookmarkId &&
+    bookmarks[state.manualBookmarkId] &&
+    !bookmarks[state.manualBookmarkId].auto;
+  const id = updatingManual ? state.manualBookmarkId : "bm-" + Date.now();
   bookmarks[id] = {
     name,
     savedAt: new Date().toISOString(),
     session: snap,
-    auto: !!state.autoBookmarkId,
+    auto: false,
     fingerprint: treeFingerprint(snap),
   };
   saveBookmarksStore(bookmarks);
-  state.autoBookmarkId = id;
   state.autoBookmarkName = name;
+  state.manualBookmarkId = id;
+  state.manualBookmarkLoaded = updatingManual;
   renderBookmarkList();
   closeBookmarkDialog();
-  toast(state.autoBookmarkId && bookmarks[id]?.auto ? `已更新标签「${name}」` : `已保存标签「${name}」`);
+  toast(updatingManual ? `已更新标签「${name}」` : `已保存新标签「${name}」`);
 }
 
 function deleteBookmark(id) {
@@ -290,6 +564,9 @@ function deleteBookmark(id) {
   const name = bookmarks[id]?.name || "标签";
   delete bookmarks[id];
   saveBookmarksStore(bookmarks);
+  if (state.autoBookmarkId === id || state.manualBookmarkId === id) {
+    resetBookmarkTracking();
+  }
   renderBookmarkList();
   toast(`已删除「${name}」`);
 }
@@ -299,8 +576,16 @@ async function loadBookmark(id) {
   if (!bm?.session) return;
   const ok = await restoreSession(bm.session);
   if (ok) {
-    state.autoBookmarkId = bm.auto ? id : null;
     state.autoBookmarkName = bm.name || null;
+    if (bm.auto) {
+      state.autoBookmarkId = id;
+      state.manualBookmarkId = null;
+      state.manualBookmarkLoaded = false;
+    } else {
+      state.autoBookmarkId = null;
+      state.manualBookmarkId = id;
+      state.manualBookmarkLoaded = true;
+    }
     toast(`已打开标签「${bm.name}」`);
   } else if (bm.session?.panels?.length) {
     toast("标签恢复失败：部分符号可能已移动，请尝试重新搜索打开");
@@ -385,7 +670,9 @@ async function restoreSession(snap) {
       }
       schedule(true);
     });
+    attachBookmarkTrackingForSnap(snap);
     schedulePersist();
+    await loadDebugProfiles(snap.project);
     return true;
   } catch (e) {
     toast("恢复失败: " + e.message);
@@ -393,6 +680,21 @@ async function restoreSession(snap) {
     return false;
   } finally {
     state._restoring = false;
+  }
+}
+
+/** 刷新/会话恢复后，把当前树关联到已有的 auto 标签（若存在） */
+function attachBookmarkTrackingForSnap(snap) {
+  if (!snap?.panels?.length) return;
+  const fp = treeFingerprint(snap);
+  const bookmarks = loadBookmarksStore();
+  const autoId = findAutoBookmarkId(snap.project, fp);
+  if (!autoId) return;
+  state.autoBookmarkId = autoId;
+  state.manualBookmarkId = null;
+  state.manualBookmarkLoaded = false;
+  if (!state.autoBookmarkName) {
+    state.autoBookmarkName = bookmarks[autoId]?.name || null;
   }
 }
 
@@ -447,7 +749,8 @@ async function refreshProjectStats(id) {
     const s = await api("/api/stats", { project: id });
     el.stats.textContent = `${s.files_indexed} 文件 · ${s.symbols} 符号` +
       (s.from_cache ? " · 缓存" : "") +
-      (s.truncated ? " · 已截断" : "");
+      (s.truncated ? " · 已截断" : "") +
+      (s.compile_db ? ` · 编译库 ${s.compile_db}` : "");
   } catch (e) {
     el.stats.textContent = "索引失败: " + e.message;
   }
@@ -455,9 +758,10 @@ async function refreshProjectStats(id) {
 
 async function setProject(id) {
   await flushTreeBeforeClear();
+  resetBookmarkTracking();
   state.project = id;
   clearAllPanels({ silent: true, skipSave: true });
-  await refreshProjectStats(id);
+  await Promise.all([refreshProjectStats(id), loadDebugProfiles(id)]);
 }
 
 // ---------- 搜索 ----------
@@ -518,7 +822,7 @@ function appendSearchFoot(hasTree) {
   if (!hasTree) return;
   const foot = document.createElement("div");
   foot.className = "search-foot";
-  foot.textContent = "点击：挂到当前面板保留调用树 · Shift+点击：新开根替换树";
+  foot.textContent = "点击：新开根节点（与现有树并列） · Shift+点击：挂到当前面板 · Ctrl+点击：替换整棵树";
   el.searchResults.appendChild(foot);
 }
 
@@ -630,7 +934,7 @@ function renderUsageSearchBody(ctx) {
     body.appendChild(buildUsageRow(ctx.name, u, (e) => {
       el.searchResults.classList.add("hidden");
       el.searchInput.value = "";
-      openFromSearch({ kind: "usage", name: ctx.name, usage: u }, e.shiftKey);
+      openFromSearch({ kind: "usage", name: ctx.name, usage: u }, e);
     }));
   });
 }
@@ -676,7 +980,7 @@ async function runSearch(q) {
       div.onclick = (e) => {
         el.searchResults.classList.add("hidden");
         el.searchInput.value = "";
-        openFromSearch({ kind: "def", result: r }, e.shiftKey);
+        openFromSearch({ kind: "def", result: r }, e);
       };
       el.searchResults.appendChild(div);
     });
@@ -716,18 +1020,12 @@ function getSearchAttachParent() {
   return null;
 }
 
-async function openFromSearch(item, asRoot) {
-  if (asRoot || !state.order.length) {
-    if (item.kind === "usage") {
-      await openRootUsage(item.name, item.usage);
-    } else {
-      const r = item.result;
-      await openRoot(r.file, r.name, r.start_line);
-    }
-    return;
-  }
-  const parentId = getSearchAttachParent();
-  if (!parentId) {
+async function openFromSearch(item, ev) {
+  const shift = !!(ev && ev.shiftKey);
+  const replace = !!(ev && (ev.ctrlKey || ev.metaKey));
+  const attach = shift && !replace && state.order.length > 0;
+
+  if (replace) {
     if (item.kind === "usage") await openRootUsage(item.name, item.usage);
     else {
       const r = item.result;
@@ -735,10 +1033,17 @@ async function openFromSearch(item, asRoot) {
     }
     return;
   }
-  if (item.kind === "usage") {
-    await openSearchUsage(parentId, item.name, item.usage);
-  } else {
-    await openSearchDefinition(parentId, item.result);
+  if (attach) {
+    const parentId = getSearchAttachParent();
+    if (item.kind === "usage") await openSearchUsage(parentId, item.name, item.usage);
+    else await openSearchDefinition(parentId, item.result);
+    return;
+  }
+  // 默认：追加新根节点，与已有树并列（不清空）
+  if (item.kind === "usage") await appendRootUsage(item.name, item.usage);
+  else {
+    const r = item.result;
+    await appendRoot(r.file, r.name, r.start_line);
   }
 }
 
@@ -763,14 +1068,30 @@ async function openSearchUsage(parentId, symbolName, usage) {
       focusPanel(parentId);
       return;
     }
-    const searchRef = makeSearchFromRef(parent, symbolName);
-    const id = openPanelFrom(parentId, searchRef, detail);
+    const defRef = makeSearchFromRef(parent, symbolName);
+    const usageRef = makeUsageFromRef(defRef, usage);
+    const id = openPanelFrom(parentId, usageRef, detail);
     setTimeout(() => flashLine(id, usage.line), 120);
   } catch (e) { toast("打开失败: " + e.message); }
 }
 
+async function appendRootUsage(symbolName, usage) {
+  try {
+    const detail = await api("/api/open_at", {
+      project: state.project, file: usage.file, line: usage.line,
+    });
+    if (!detail) { toast("无法打开该调用位置"); return; }
+    const id = addPanel(detail, null, null);
+    setTimeout(() => flashLine(id, usage.line), 120);
+    await autoSelectDebugProfile(usage.file);
+  } catch (e) { toast("打开失败: " + e.message); }
+}
+
+/** 替换整棵树：仅 Ctrl+搜索 或显式 openRoot 时使用 */
 async function openRootUsage(symbolName, usage) {
-  clearAllPanels();
+  await flushTreeBeforeClear();
+  resetBookmarkTracking();
+  clearAllPanels({ silent: true, skipSave: true });
   try {
     const detail = await api("/api/open_at", {
       project: state.project, file: usage.file, line: usage.line,
@@ -789,20 +1110,34 @@ async function fetchSymbol(file, name, line) {
 
 function ensureAutoBookmarkOnRoot() {
   if (state._restoring) return;
-  if (!state.project || state.order.length !== 1) return;
+  if (!state.project || !state.order.length) return;
+  const roots = state.order.filter((id) => !state.panels.get(id)?.parentId);
+  if (roots.length !== 1) return;
   const snap = serializeState();
   if (!snap) return;
   syncAutoBookmark(snap);
 }
 
-// 打开为根（清空现有所有面板）
+// 追加新根（不清空已有调用树）
+async function appendRoot(file, name, line) {
+  try {
+    const detail = await fetchSymbol(file, name, line);
+    addPanel(detail, null, null);
+    ensureAutoBookmarkOnRoot();
+    await autoSelectDebugProfile(file);
+  } catch (e) { toast("打开失败: " + e.message); }
+}
+
+// 打开为根并清空现有树（Ctrl+搜索）
 async function openRoot(file, name, line) {
   await flushTreeBeforeClear();
+  resetBookmarkTracking();
   clearAllPanels({ silent: true, skipSave: true });
   try {
     const detail = await fetchSymbol(file, name, line);
     addPanel(detail, null, null);
     ensureAutoBookmarkOnRoot();
+    await autoSelectDebugProfile(file);
   } catch (e) { toast("打开失败: " + e.message); }
 }
 
@@ -896,8 +1231,174 @@ function linkPanelFrom(parentId, fromRef, targetId, opts = {}) {
   return true;
 }
 
+// ---------- 切换箭头来源（A→B 改为 C→B） ----------
+
+function panelDescendants(panelId) {
+  const out = new Set();
+  const walk = (pid) => {
+    for (const cid of state.order) {
+      const p = state.panels.get(cid);
+      if (p?.parentId === pid) {
+        out.add(cid);
+        walk(cid);
+      }
+    }
+  };
+  walk(panelId);
+  return out;
+}
+
+function canReparentTo(targetId, newParentId) {
+  if (!targetId || !newParentId || targetId === newParentId) return false;
+  return !panelDescendants(targetId).has(newParentId);
+}
+
+function fromRefFromTokenEl(el) {
+  return {
+    name: el.dataset.name,
+    line: parseInt(el.dataset.line, 10),
+    col: parseInt(el.dataset.col, 10),
+    receiver: el.dataset.receiver || "",
+    refKind: el.dataset.refKind || (el.classList.contains("ref") ? "call" : "reference"),
+  };
+}
+
+/** 在父面板里找与子函数名最匹配的调用点（快速绑定时用） */
+function findBestRefInPanel(parentPanel, childName) {
+  const d = parentPanel.detail;
+  const refs = d.references || [];
+  const hit = refs.find((r) => r.name === childName);
+  if (hit) {
+    return {
+      name: hit.name,
+      line: hit.line,
+      col: hit.col,
+      receiver: hit.receiver || "",
+      refKind: hit.ref_kind || "call",
+    };
+  }
+  if (refs.length) {
+    const r = refs[0];
+    return {
+      name: r.name,
+      line: r.line,
+      col: r.col,
+      receiver: r.receiver || "",
+      refKind: r.ref_kind || "call",
+    };
+  }
+  return {
+    name: childName,
+    line: d.start_line,
+    col: 1,
+    refKind: "correlation",
+  };
+}
+
+function unlinkPrimaryParent(target) {
+  const oldParentId = target.parentId;
+  const oldRef = target.fromRef;
+  if (!oldParentId || !oldRef) return;
+  const oldParent = state.panels.get(oldParentId);
+  if (!oldParent?.childByRef) return;
+  const rk = refKey(oldRef);
+  if (oldParent.childByRef[rk] === target.id) delete oldParent.childByRef[rk];
+}
+
+function recalculateDepth(panelId) {
+  const panel = state.panels.get(panelId);
+  if (!panel) return;
+  const parent = panel.parentId ? state.panels.get(panel.parentId) : null;
+  panel.depth = parent ? parent.depth + 1 : 0;
+  for (const id of state.order) {
+    const p = state.panels.get(id);
+    if (p?.parentId === panelId) recalculateDepth(id);
+  }
+}
+
+function reparentPanel(targetId, newParentId, fromRef) {
+  const target = state.panels.get(targetId);
+  const newParent = state.panels.get(newParentId);
+  if (!target || !newParent || !canReparentTo(targetId, newParentId)) return false;
+
+  const rk = refKey(fromRef);
+  if (target.extraLinks) {
+    target.extraLinks = target.extraLinks.filter(
+      (l) => !(l.parentId === newParentId && refKey(l.fromRef) === rk)
+    );
+  }
+
+  unlinkPrimaryParent(target);
+  target.parentId = newParentId;
+  target.fromRef = fromRef;
+  target.manualPos = null;
+
+  if (fromRef.refKind !== "member") {
+    newParent.childByRef = newParent.childByRef || {};
+    newParent.childByRef[rk] = targetId;
+  }
+
+  recalculateDepth(targetId);
+  state.focusNew = targetId;
+  render();
+  schedulePersist();
+  toast(`箭头来源已改为 ${newParent.detail.name} → ${target.detail.name}`);
+  return true;
+}
+
+function cancelReparentMode() {
+  if (!state.reparentTargetId) return;
+  state.reparentTargetId = null;
+  document.body.classList.remove("reparent-mode");
+  document.querySelectorAll(".panel.reparent-target, .panel.reparent-candidate").forEach((n) => {
+    n.classList.remove("reparent-target", "reparent-candidate");
+  });
+}
+
+function startReparentMode(panelId) {
+  const panel = state.panels.get(panelId);
+  if (!panel?.parentId) {
+    toast("根面板没有箭头来源");
+    return;
+  }
+  cancelReparentMode();
+  state.reparentTargetId = panelId;
+  document.body.classList.add("reparent-mode");
+  for (const id of state.order) {
+    const el = state.panels.get(id)?.el;
+    if (!el) continue;
+    if (id === panelId) el.classList.add("reparent-target");
+    else if (canReparentTo(panelId, id)) el.classList.add("reparent-candidate");
+  }
+  toast("点击其他面板中的蓝色调用处切换来源；点候选面板标题可快速绑定（Esc 取消）");
+}
+
+function tryReparentFromToken(sourcePanelId, tokenEl) {
+  const targetId = state.reparentTargetId;
+  if (!targetId || sourcePanelId === targetId) return false;
+  if (!canReparentTo(targetId, sourcePanelId)) {
+    toast("不能指向自身或子面板");
+    return true;
+  }
+  reparentPanel(targetId, sourcePanelId, fromRefFromTokenEl(tokenEl));
+  cancelReparentMode();
+  return true;
+}
+
+function tryReparentFromHeader(sourcePanelId) {
+  const targetId = state.reparentTargetId;
+  if (!targetId || sourcePanelId === targetId) return;
+  if (!canReparentTo(targetId, sourcePanelId)) return;
+  const target = state.panels.get(targetId);
+  const parent = state.panels.get(sourcePanelId);
+  if (!target || !parent) return;
+  reparentPanel(targetId, sourcePanelId, findBestRefInPanel(parent, target.detail.name));
+  cancelReparentMode();
+}
+
 // 关闭面板及其所有后代
 function closePanel(id) {
+  if (state.reparentTargetId === id) cancelReparentMode();
   const toRemove = new Set();
   const collect = (pid) => {
     toRemove.add(pid);
@@ -925,12 +1426,13 @@ function closePanel(id) {
   render();
   schedulePersist();
   if (!state.order.length) {
-    state.autoBookmarkId = null;
+    resetBookmarkTracking();
     persistTreeNow(true);
   }
 }
 
 function clearAllPanels(opts = {}) {
+  cancelReparentMode();
   if (!opts.skipSave && !opts.silent && state.order.length) {
     persistTreeNow(true);
   }
@@ -951,14 +1453,19 @@ async function flushTreeBeforeClear() {
 //  - 普通点击：调用(.ref)走函数解析；变量(.tok)走 resolve_at（局部声明优先）
 //  - Alt/Ctrl/Meta 或右键：查找该标识符的所有用法
 async function navFromToken(panelId, el, ev) {
+  if (state.reparentTargetId) {
+    tryReparentFromToken(panelId, el);
+    return;
+  }
   const panel = state.panels.get(panelId);
   const name = el.dataset.name;
   const line = parseInt(el.dataset.line, 10);
   const col = parseInt(el.dataset.col, 10);
+  // refKind 决定连线颜色与方向：call / reference / member / usage / search
   const fromRef = {
     name, line, col,
     receiver: el.dataset.receiver || "",
-    refKind: el.dataset.refKind || "",
+    refKind: el.dataset.refKind || (el.classList.contains("ref") ? "call" : "reference"),
   };
   const isMemberFp = fromRef.refKind === "member";
 
@@ -1138,7 +1645,7 @@ function onEscCloseUsages(e) {
 }
 
 // 点击用法行 → 打开所属函数/宏（或行上下文）并闪烁用法行
-// fromRef 必须是「查找用法」时点击的标识符（父面板内 line/col），连线才从该 token 出发
+// 用法连线：子面板内用法 token → 父面板定义（箭头指向定义，与「顺调用链」相反）
 async function openUsageRow(originPanelId, fromRef, u) {
   closeUsagesPop();
   try {
@@ -1146,13 +1653,7 @@ async function openUsageRow(originPanelId, fromRef, u) {
       project: state.project, file: u.file, line: u.line,
     });
     if (!detail) { toast("无法打开该用法位置"); return; }
-    const usageRef = {
-      name: fromRef.name,
-      line: fromRef.line,
-      col: fromRef.col,
-      receiver: fromRef.receiver || "",
-      refKind: fromRef.refKind || "usage",
-    };
+    const usageRef = makeUsageFromRef(fromRef, u);
     const id = openPanelFrom(originPanelId, usageRef, detail);
     setTimeout(() => flashLine(id, u.line), 120);
   } catch (e) { toast("打开失败: " + e.message); }
@@ -1290,7 +1791,7 @@ function renderFuncMapRow(panelId, container) {
     const cName = document.createElement("span");
     cName.className = "map-fn map-fn-root";
     cName.title = d.file;
-    cName.textContent = d.name;
+    cName.innerHTML = `<span class="map-root-tag">根</span>${escapeHtml(d.name)}`;
     chain.appendChild(cName);
   }
 
@@ -1448,6 +1949,11 @@ function render() {
 
   // 需先完成布局测量，再算高亮与连线
   requestAnimationFrame(() => { layout(); decorate(); renderFuncMap(); });
+  for (const id of state.order) {
+    const panel = state.panels.get(id);
+    if (panel._compileCtx?.available) updatePanelCompileUi(panel);
+    else fetchPanelCompileContext(panel);
+  }
 }
 
 /*
@@ -1675,10 +2181,26 @@ function renderPanel(panel) {
   header.innerHTML =
     `<span class="fn">${escapeHtml(d.name)}</span>` +
     `<span class="kind">${escapeHtml(d.kind)}</span>` +
+    (panel.parentId
+      ? `<span class="reparent-src" title="切换箭头来源：从其他面板重新指定调用点">⇄</span>`
+      : "") +
     `<span class="file" title="${escapeHtml(d.file)}">${escapeHtml(d.file)}:${d.start_line}</span>` +
     `<span class="ai-open" title="AI 分析此函数">✦${hasAiNotes(d) ? '<i class="ai-dot"></i>' : ""}</span>` +
     `<span class="close" title="关闭此面板及右侧分支">×</span>`;
   header.querySelector(".close").onclick = (e) => { e.stopPropagation(); closePanel(panel.id); };
+  const repBtn = header.querySelector(".reparent-src");
+  if (repBtn) {
+    repBtn.onclick = (e) => {
+      e.stopPropagation();
+      if (state.reparentTargetId === panel.id) cancelReparentMode();
+      else startReparentMode(panel.id);
+    };
+  }
+  header.addEventListener("click", (e) => {
+    if (!state.reparentTargetId || state.reparentTargetId === panel.id) return;
+    if (e.target.closest(".close, .ai-open, .reparent-src")) return;
+    tryReparentFromHeader(panel.id);
+  });
   header.querySelector(".ai-open").onclick = (e) => {
     e.stopPropagation();
     openPanelAi(panel.id, { selectedText: "" });
@@ -1760,6 +2282,48 @@ function renderLine(text, callColMap, lineNo) {
   return html;
 }
 
+/** 在用法行文本中定位标识符列（grep 命中无 col 时的回退） */
+function colOfNameInLine(text, name) {
+  if (!text || !name) return 1;
+  const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+  const m = re.exec(text);
+  return m ? m.index + 1 : 1;
+}
+
+/** 构造「查用法」连线的 fromRef：锚点在子面板用法行，defRef 指向定义侧 */
+function makeUsageFromRef(defRef, usage) {
+  return {
+    name: defRef.name,
+    line: usage.line,
+    col: colOfNameInLine(usage.text || "", defRef.name),
+    receiver: defRef.receiver || "",
+    refKind: "usage",
+    defRef: {
+      name: defRef.name,
+      line: defRef.line,
+      col: defRef.col,
+      receiver: defRef.receiver || "",
+    },
+  };
+}
+
+/** 连线语义 → CSS 类 / 箭头方向（usage 为子→父，其余为父→子） */
+function classifyLink(fromRef) {
+  if (!fromRef) return "call";
+  const k = fromRef.refKind || "call";
+  if (k === "usage") return "usage";
+  if (k === "search") return "correlation";
+  if (k === "reference") return "reference";
+  return "call";
+}
+
+const LINK_MARKERS = {
+  call: "arrow-call",
+  reference: "arrow-ref",
+  usage: "arrow-usage",
+  correlation: "arrow-corr",
+};
+
 /** 在父面板 DOM 中定位来源 token（优先 line+col，退回同行同名） */
 function findTokenInPanel(panelEl, fromRef) {
   if (!panelEl || !fromRef) return null;
@@ -1800,6 +2364,31 @@ function linkAnchorFromParent(parentEl, parentDetail, fromRef) {
   return { x: pRect.right, y: pRect.top + 40, token: null };
 }
 
+/** 连线起点（查用法）：Y 对齐子面板内用法 token，X 固定在子面板左缘 */
+function linkAnchorInChild(childEl, childDetail, fromRef) {
+  const cRect = childEl.getBoundingClientRect();
+  const token = findTokenInPanel(childEl, fromRef);
+  if (token) {
+    const tr = token.getBoundingClientRect();
+    return {
+      x: cRect.left,
+      y: Math.min(Math.max(tr.top + tr.height / 2, cRect.top + 8), cRect.bottom - 8),
+      token,
+    };
+  }
+  const idx = childDetail ? fromRef.line - childDetail.start_line : -1;
+  const lineEls = childEl.querySelectorAll(".code-line");
+  if (idx >= 0 && idx < lineEls.length) {
+    const lr = lineEls[idx].getBoundingClientRect();
+    return {
+      x: cRect.left,
+      y: Math.min(Math.max(lr.top + lr.height / 2, cRect.top + 8), cRect.bottom - 8),
+      token: null,
+    };
+  }
+  return { x: cRect.left, y: cRect.top + 40, token: null };
+}
+
 // 统一装饰：高亮每个「催生了子面板」的来源标识符，并绘制父→子箭头连线。
 // 集中处理可正确支持「同一父面板的多个分支」（多条高亮 + 多条连线）。
 function decorate() {
@@ -1817,6 +2406,22 @@ function decorate() {
       if (!parentEl) continue;
       const parent = state.panels.get(link.parentId);
       if (!parent?.detail) continue;
+      const kind = classifyLink(link.fromRef);
+
+      if (kind === "usage" && link.fromRef.defRef) {
+        // 查用法：子面板用法处 → 父面板定义处（箭头指向定义）
+        const childAnchor = linkAnchorInChild(childEl, panel.detail, link.fromRef);
+        const target = linkAnchorFromParent(parentEl, parent.detail, link.fromRef.defRef);
+        if (childAnchor.token) childAnchor.token.classList.add("src-highlight");
+        if (target.token) target.token.classList.add("src-highlight");
+        else {
+          const idx = link.fromRef.defRef.line - parent.detail.start_line;
+          const lineEls = parentEl.querySelectorAll(".code-line");
+          if (idx >= 0 && idx < lineEls.length) lineEls[idx].classList.add("src-highlight");
+        }
+        continue;
+      }
+
       const anchor = linkAnchorFromParent(parentEl, parent.detail, link.fromRef);
       if (anchor.token) {
         anchor.token.classList.add("src-highlight");
@@ -1831,21 +2436,32 @@ function decorate() {
 }
 
 function ensureSvg() {
+  const mk = (id, fill) =>
+    `<marker id="${id}" markerWidth="9" markerHeight="9" refX="7" refY="3"
+      orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="${fill}"></path>
+    </marker>`;
+  const defsHtml =
+    `<defs>` +
+    mk("arrow-call", "#58a6ff") +
+    mk("arrow-ref", "#3fb950") +
+    mk("arrow-usage", "#d2a8ff") +
+    mk("arrow-corr", "#ffb14d") +
+    `</defs>`;
+
   let svg = document.getElementById("connectors");
   if (!svg) {
     svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.id = "connectors";
-    svg.innerHTML =
-      `<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="7" refY="3"
-        orient="auto" markerUnits="strokeWidth">
-        <path d="M0,0 L7,3 L0,6 Z" fill="var(--accent)"></path>
-      </marker></defs>`;
+    svg.innerHTML = defsHtml;
     document.body.appendChild(svg);
+  } else if (!document.getElementById("arrow-call")) {
+    svg.innerHTML = defsHtml;
   }
   return svg;
 }
 
-// 在父面板右缘与子面板左缘之间画曲线箭头；连线走列间空隙，尽量不压代码。
+// 父→子（调用/引用/搜索）或 子→父（查用法）曲线箭头；颜色与方向由 classifyLink 决定。
 function drawConnectors() {
   const svg = ensureSvg();
   const vw = window.innerWidth, vh = window.innerHeight;
@@ -1858,22 +2474,36 @@ function drawConnectors() {
     const childEl = document.querySelector(`.panel[data-id="${id}"]`);
     if (!childEl) continue;
     const cRect = childEl.getBoundingClientRect();
-    const y2 = Math.min(Math.max(cRect.top + 20, 0), vh);
 
     for (const link of panelLinks(panel)) {
       const parentEl = document.querySelector(`.panel[data-id="${link.parentId}"]`);
       if (!parentEl) continue;
       const parent = state.panels.get(link.parentId);
-      const anchor = linkAnchorFromParent(parentEl, parent?.detail, link.fromRef);
-      const x1 = anchor.x;
-      const y1 = anchor.y;
-      const x2 = cRect.left;
+      const kind = classifyLink(link.fromRef);
+      const marker = LINK_MARKERS[kind] || LINK_MARKERS.call;
+      let x1, y1, x2, y2;
+
+      if (kind === "usage" && link.fromRef.defRef) {
+        const childAnchor = linkAnchorInChild(childEl, panel.detail, link.fromRef);
+        const target = linkAnchorFromParent(parentEl, parent?.detail, link.fromRef.defRef);
+        x1 = childAnchor.x;
+        y1 = childAnchor.y;
+        x2 = target.x;
+        y2 = target.y;
+      } else {
+        const anchor = linkAnchorFromParent(parentEl, parent?.detail, link.fromRef);
+        x1 = anchor.x;
+        y1 = anchor.y;
+        x2 = cRect.left;
+        y2 = Math.min(Math.max(cRect.top + 20, 0), vh);
+      }
+
       const mx = (x1 + x2) / 2;
       const d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
       const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      path.setAttribute("class", "link");
+      path.setAttribute("class", `link link-${kind}`);
       path.setAttribute("d", d);
-      path.setAttribute("marker-end", "url(#arrow)");
+      path.setAttribute("marker-end", `url(#${marker})`);
       svg.appendChild(path);
     }
   }
@@ -1982,7 +2612,12 @@ function closeCodeContextMenu() {
 
 function showCodeContextMenu(ev, panelId, selectedText, tokenEl) {
   closeCodeContextMenu();
-  codeCtxState = { panelId, selectedText, tokenEl };
+  const panel = state.panels.get(panelId);
+  const lineEl = ev.target.closest(".code-line");
+  const lineNo = lineEl
+    ? parseInt(lineEl.querySelector(".ln")?.textContent || "0", 10)
+    : panel?.detail?.start_line || 0;
+  codeCtxState = { panelId, selectedText, tokenEl, lineNo };
   const menu = el.codeCtxMenu;
   menu.querySelector('[data-action="usages"]').classList.toggle(
     "hidden", !tokenEl
@@ -2331,6 +2966,16 @@ el.bookmarkNameInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") saveCurrentAsBookmark();
   if (e.key === "Escape") closeBookmarkDialog();
 });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.reparentTargetId) cancelReparentMode();
+});
+
+document.addEventListener("click", (e) => {
+  if (!state.reparentTargetId) return;
+  if (e.target.closest(".panel, .code-ctx-menu, .bookmark-dialog, .search-wrap, .topbar")) return;
+  cancelReparentMode();
+});
+
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".search-wrap")) el.searchResults.classList.add("hidden");
 });
@@ -2340,7 +2985,8 @@ el.codeCtxMenu.addEventListener("click", (e) => {
   if (!item || !codeCtxState) return;
   e.stopPropagation();
   const action = item.dataset.action;
-  const { panelId, selectedText, tokenEl } = codeCtxState;
+  const { panelId, selectedText, tokenEl, lineNo } = codeCtxState;
+  const panel = state.panels.get(panelId);
   closeCodeContextMenu();
   if (action === "ai") {
     openPanelAi(panelId, {
@@ -2351,6 +2997,19 @@ el.codeCtxMenu.addEventListener("click", (e) => {
     });
   } else if (action === "usages" && tokenEl) {
     navFromToken(panelId, tokenEl, { type: "contextmenu" });
+  } else if (action === "gdb-break" && panel?.detail) {
+    copyGdbBreak(panel.detail.file, lineNo || panel.detail.start_line);
+  } else if (action === "gdb-fn-break" && panel?.detail) {
+    copyGdbBreak(panel.detail.file, panel.detail.start_line);
+  }
+});
+
+el.btnExportGdb.addEventListener("click", () => exportGdbScript());
+el.debugProfileSelect.addEventListener("change", () => {
+  const p = selectedDebugProfile();
+  if (p) {
+    saveDebugProfileChoice(p.id);
+    toast(`已选：${p.name}`);
   }
 });
 

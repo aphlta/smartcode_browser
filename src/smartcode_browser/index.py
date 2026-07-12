@@ -90,7 +90,7 @@ class SymbolIndex:
                     self._compiledb = load_compile_db(
                         self.project.root,
                         self.project_id,
-                        getattr(self.project, "compile_commands", ""),
+                        self.project.compile_commands,
                     )
                     self._compiledb_loaded = True
         return self._compiledb

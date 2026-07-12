@@ -20,6 +20,14 @@ from pathlib import Path
 import yaml
 
 
+def _normalize_compile_commands(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return [str(p) for p in raw if p]
+    if isinstance(raw, str) and raw:
+        return [raw]
+    return []
+
+
 @dataclass
 class Project:
     """单个可浏览项目的配置。"""
@@ -31,9 +39,12 @@ class Project:
     include_paths: list[str] = field(default_factory=list)
     extra_languages: list[str] = field(default_factory=list)
     exclude_dirs: list[str] = field(default_factory=list)
-    # 可选：编译数据库（compile_commands.json）相对/绝对路径。
-    # 配置后用于「按实际编译的翻译单元」优先解析定义、消歧多 arch 同名。
-    compile_commands: str = ""
+    # 可选：编译数据库路径（字符串或列表，多子工程时合并）
+    compile_commands: list[str] = field(default_factory=list)
+    # 可选：显式 GDB 调试配置（与项目根 .vscode/launch.json 合并）
+    debug_profiles: list[dict] = field(default_factory=list)
+    # 可选：默认 GDB 配置 id（slug，与 launch.json 名称对应）
+    default_debug_profile: str = ""
 
     def exists(self) -> bool:
         return self.root.is_dir()
@@ -118,7 +129,9 @@ def load_projects() -> list[Project]:
                 include_paths=raw.get("include_paths", []),
                 extra_languages=raw.get("extra_languages", []),
                 exclude_dirs=raw.get("exclude_dirs", list(_DEFAULT_EXCLUDES)),
-                compile_commands=raw.get("compile_commands", ""),
+                compile_commands=_normalize_compile_commands(raw.get("compile_commands")),
+                debug_profiles=raw.get("debug_profiles") or [],
+                default_debug_profile=str(raw.get("default_debug_profile") or ""),
             )
         )
     return projects or _builtin_projects()
